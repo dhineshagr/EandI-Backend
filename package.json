@@ -1,0 +1,32 @@
+{
+  "name": "eandi-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "db:drop": "psql \"$DATABASE_URL\" -f sql/99_drop_all.sql",
+    "db:init": "psql \"$DATABASE_URL\" -f sql/00_create_schema.sql && psql \"$DATABASE_URL\" -f sql/01_tables.sql && psql \"$DATABASE_URL\" -f sql/02_indexes.sql"
+  },
+  "dependencies": {
+    "@azure/storage-blob": "^12.28.0",
+    "@okta/jwt-verifier": "^3.0.1",
+    "axios": "^1.13.1",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "helmet": "^7.0.0",
+    "http-errors": "^2.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^3.2.0",
+    "morgan": "^1.10.0",
+    "mssql": "^12.0.0",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
