@@ -4,25 +4,107 @@ trigger:
 pool:
   vmImage: ubuntu-latest
 
+variables:
+- name: azureSubscription
+  value: 'EANDI-SSP-DEV-RG'
+
+- name: webAppName
+  value: 'eni-ssp-backend-dev'
+
+- name: workingDirectory
+  value: '.'
+
+# ✅ Variable group must be a LIST item (NOT under key/value variables)
+- group: eni-ssp-backend-dev
+
 steps:
+# 1) Install Node
 - task: NodeTool@0
   inputs:
-    versionSpec: '20.x'
-  displayName: 'Install Node.js'
+    versionSpec: '24.x'
+  displayName: 'Install Node.js 24'
 
+# 2) Install deps + optional build
 - script: |
-    npm install
-  displayName: 'Install backend dependencies'
+    set -e
+    cd $(workingDirectory)
+    npm ci
+    if npm run | grep -qE ' build'; then
+      npm run build
+    else
+      echo "No build script found, skipping build."
+    fi
+  displayName: 'Install dependencies and build (if applicable)'
 
-- task: CopyFiles@2
+# 3) Zip backend (exclude root folder)
+- task: ArchiveFiles@2
   inputs:
-    contents: '**'
-    targetFolder: '$(Build.ArtifactStagingDirectory)'
-  displayName: 'Copy backend files'
+    rootFolderOrFile: '$(workingDirectory)'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)/backend.zip'
+    replaceExistingArchive: true
+    verbose: true
+  displayName: 'Archive backend as ZIP'
 
+# 4) Publish artifact (optional)
 - task: PublishBuildArtifacts@1
   inputs:
-    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)/backend.zip'
     ArtifactName: 'backend'
     publishLocation: 'Container'
   displayName: 'Publish backend artifact'
+
+# 5) Push env vars to App Service App Settings
+- task: AzureAppServiceSettings@1
+  displayName: 'Apply App Settings (env vars) to Backend Web App'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    appName: '$(webAppName)'
+    resourceGroupName: 'DevResourceGroup-SSP-EUS'
+    appSettings: |
+      [
+        { "name": "NODE_ENV", "value": "$(NODE_ENV)", "slotSetting": false },
+        { "name": "PORT", "value": "$(PORT)", "slotSetting": false },
+
+        { "name": "JWT_SECRET", "value": "$(JWT_SECRET)", "slotSetting": true },
+        { "name": "JWT_EXPIRES_IN", "value": "$(JWT_EXPIRES_IN)", "slotSetting": false },
+
+        { "name": "SAML_ISSUER", "value": "$(SAML_ISSUER)", "slotSetting": false },
+        { "name": "SAML_CALLBACK_URL", "value": "$(SAML_CALLBACK_URL)", "slotSetting": false },
+        { "name": "OKTA_SIGNON_URL", "value": "$(OKTA_SIGNON_URL)", "slotSetting": false },
+        { "name": "OKTA_SSO_URL", "value": "$(OKTA_SSO_URL)", "slotSetting": false },
+        { "name": "OKTA_METADATA_URL", "value": "$(OKTA_METADATA_URL)", "slotSetting": false },
+        { "name": "OKTA_X509_CERT", "value": "$(OKTA_X509_CERT)", "slotSetting": true },
+
+        { "name": "FRONTEND_SUCCESS_REDIRECT", "value": "$(FRONTEND_SUCCESS_REDIRECT)", "slotSetting": false },
+        { "name": "CORS_ORIGIN", "value": "$(CORS_ORIGIN)", "slotSetting": false },
+        { "name": "FRONTEND_BASE_URL", "value": "$(FRONTEND_BASE_URL)", "slotSetting": false },
+        { "name": "SESSION_SECRET", "value": "$(SESSION_SECRET)", "slotSetting": true },
+
+        { "name": "DATABASE_URL", "value": "$(DATABASE_URL)", "slotSetting": true },
+        { "name": "DB_SERVER", "value": "$(DB_SERVER)", "slotSetting": false },
+        { "name": "DB_USER", "value": "$(DB_USER)", "slotSetting": true },
+        { "name": "DB_PASSWORD", "value": "$(DB_PASSWORD)", "slotSetting": true },
+        { "name": "DB_NAME", "value": "$(DB_NAME)", "slotSetting": false },
+        { "name": "DB_PORT", "value": "$(DB_PORT)", "slotSetting": false },
+
+        { "name": "AZURE_STORAGE_CONNECTION_STRING", "value": "$(AZURE_STORAGE_CONNECTION_STRING)", "slotSetting": true },
+        { "name": "AZURE_DOWNLOAD_CONTAINERS", "value": "$(AZURE_DOWNLOAD_CONTAINERS)", "slotSetting": false },
+
+        { "name": "MAIL_USER", "value": "$(MAIL_USER)", "slotSetting": true },
+        { "name": "MAIL_PASS", "value": "$(MAIL_PASS)", "slotSetting": true },
+        { "name": "MAIL_HOST", "value": "$(MAIL_HOST)", "slotSetting": false },
+        { "name": "MAIL_PORT", "value": "$(MAIL_PORT)", "slotSetting": false },
+        { "name": "NOTIFY_TO", "value": "$(NOTIFY_TO)", "slotSetting": false },
+
+        { "name": "PIPELINE_TRIGGER_URL", "value": "$(PIPELINE_TRIGGER_URL)", "slotSetting": false }
+      ]
+
+# 6) Deploy zip to Azure Web App
+- task: AzureWebApp@1
+  displayName: 'Deploy backend.zip to Azure Web App'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    appName: '$(webAppName)'
+    package: '$(Build.ArtifactStagingDirectory)/backend.zip'
