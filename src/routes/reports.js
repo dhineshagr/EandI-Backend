@@ -4,54 +4,33 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * DATA MODEL (expected)
- * ─────────────────────────────────────────────────────────────────────────────
- * report_number(report_number PK, filename, report_type, uploaded_by, uploaded_at_utc,
- *               status, note, created_at_utc, updated_at_utc)
- *
- * cur_invoice_header(report_number PK/FK -> report_number.report_number,
- *                    bp_code, customer_id, report_status, approved_by,
- *                    approved_at_utc, updated_at_utc)
- *
- * cur_invoice_detail(cur_detail_id PK, report_number FK,
- *                    bp_code, customer_id, member_id, member_number, member_name,
- *                    member_address, member_city, member_state, member_zip,
- *                    invoice_number, amount, dq_status, dq_messages,
- *                    report_status, updated_at_utc, approved_by, approved_at_utc)
- *
- * audit_log(audit_id PK, report_number, row_key, field_name, old_value, new_value,
- *           changed_by, change_reason, changed_at_utc)
- *
- * users_audit_log(audit_id PK, user_email, action, context_json, created_at_utc)
- * ─────────────────────────────────────────────────────────────────────────────
- */
-
+/* ======================================================================
+   Helpers
+====================================================================== */
 const asInt = (v, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
 };
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * REGISTER A NEW REPORT (metadata only)
- * ─────────────────────────────────────────────────────────────────────────────
- */
+/* ======================================================================
+   REGISTER REPORT (Metadata only)
+====================================================================== */
 router.post("/reports/register", requireAuth, async (req, res, next) => {
   try {
     const { filename, report_type = "Sales", note = "" } = req.body || {};
-    if (!filename)
+    if (!filename) {
       return res.status(400).json({ error: "filename is required" });
+    }
+
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
     const sql = `
       INSERT INTO report_number
         (filename, report_type, uploaded_by, uploaded_at_utc, status, note, created_at_utc, updated_at_utc)
-      OUTPUT INSERTED.report_number, INSERTED.filename, INSERTED.report_type,
-             INSERTED.uploaded_by, INSERTED.uploaded_at_utc, INSERTED.status, INSERTED.note
+      OUTPUT INSERTED.*
       VALUES (@p1, @p2, @p3, GETUTCDATE(), 'new', @p4, GETUTCDATE(), GETUTCDATE());
     `;
+
     const { rows } = await query(sql, [
       filename,
       report_type,
@@ -59,19 +38,14 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       note,
     ]);
 
+    // best-effort audit
     try {
       await query(
         `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
-         VALUES (@p1, @p2, @p3, GETUTCDATE());`,
-        [
-          uploaded_by,
-          "register_report",
-          JSON.stringify({ filename, report_type, note }),
-        ]
+         VALUES (@p1,'register_report',@p2,GETUTCDATE());`,
+        [uploaded_by, JSON.stringify({ filename, report_type, note })]
       );
-    } catch (e) {
-      console.warn("users_audit_log insert skipped:", e.message);
-    }
+    } catch {}
 
     res.json({ report: rows[0] });
   } catch (err) {
@@ -80,49 +54,39 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * LIST REPORTS (joins header + aggregates detail + derived status)
- * ─────────────────────────────────────────────────────────────────────────────
- */
-router.get("/reports/list", requireAuth, async (req, res, next) => {
+/* ======================================================================
+   LIST REPORTS (Dashboard)
+====================================================================== */
+router.get("/reports/list", requireAuth, async (_req, res, next) => {
   try {
     const sql = `
- SELECT
-    r.report_number,
-    r.filename,
-    r.report_type,
-    r.uploaded_by,
-    r.uploaded_at_utc,
+      SELECT
+        r.report_number,
+        r.filename,
+        r.report_type,
+        r.uploaded_by,
+        r.uploaded_at_utc,
 
-    -- Removed bp_code + header customer_id (no longer exist)
+        COUNT(d.cur_detail_id) AS total_rows,
+        SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) AS passed_count,
+        SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+        SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+        SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) AS validated_count,
 
-    -- Aggregate counts from detail
-    COUNT(d.cur_detail_id) AS total_rows,
-    SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) AS passed_count,
-    SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-    SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
-    SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) AS validated_count,
-
-    -- Derived report status
-    CASE
-        WHEN SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'Failed'
-        WHEN COUNT(d.cur_detail_id) > 0
-             AND SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'Approved'
-        WHEN SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) > 0 THEN 'Passed'
-        WHEN SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'Validated'
-        ELSE 'Pending'
-    END AS status
-
-FROM report_number r
-LEFT JOIN cur_invoice_header h ON h.report_number = r.report_number
-LEFT JOIN cur_invoice_detail d ON d.report_number = r.report_number
-
-GROUP BY
-    r.report_number, r.filename, r.report_type, r.uploaded_by, r.uploaded_at_utc
-
-ORDER BY r.uploaded_at_utc DESC;
-
+        CASE
+          WHEN SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
+          WHEN COUNT(d.cur_detail_id) > 0
+               AND SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'approved'
+          WHEN SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) > 0 THEN 'passed'
+          WHEN SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'validated'
+          ELSE 'pending'
+        END AS status
+      FROM report_number r
+      LEFT JOIN cur_invoice_detail d
+        ON d.report_number = r.report_number
+      GROUP BY
+        r.report_number, r.filename, r.report_type, r.uploaded_by, r.uploaded_at_utc
+      ORDER BY r.uploaded_at_utc DESC;
     `;
 
     const { rows } = await query(sql);
@@ -133,17 +97,16 @@ ORDER BY r.uploaded_at_utc DESC;
   }
 });
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * REPORT SUMMARY
- * ─────────────────────────────────────────────────────────────────────────────
- */
+/* ======================================================================
+   REPORT SUMMARY
+====================================================================== */
 router.get(
   "/reports/:reportNumber/summary",
   requireAuth,
   async (req, res, next) => {
     try {
       const rn = asInt(req.params.reportNumber);
+      if (!rn) return res.status(400).json({ error: "Invalid report number" });
 
       const sql = `
       SELECT
@@ -161,29 +124,25 @@ router.get(
           ELSE 'In Progress'
         END AS report_status
       FROM cur_invoice_detail
-      WHERE report_number = @p1
+      WHERE report_number=@p1
       GROUP BY report_number;
     `;
 
       const { rows } = await query(sql, [rn]);
-
-      if (rows.length === 0) {
-        return res.status(404).json({ message: "Report not found" });
-      }
+      if (!rows.length)
+        return res.status(404).json({ error: "Report not found" });
 
       res.json({ report: rows[0], counts: rows[0] });
     } catch (err) {
-      console.error("❌ GET /reports/:reportNumber/summary error:", err);
+      console.error("❌ GET summary error:", err);
       next(err);
     }
   }
 );
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * PAGED ROWS (detail)
- * ─────────────────────────────────────────────────────────────────────────────
- */
+/* ======================================================================
+   DETAIL ROWS
+====================================================================== */
 router.get(
   "/reports/:reportNumber/rows",
   requireAuth,
@@ -197,42 +156,41 @@ router.get(
       let sql = `
       SELECT *
       FROM cur_invoice_detail
-      WHERE report_number = @p1
+      WHERE report_number=@p1
     `;
       const params = [rn];
 
       if (status) {
-        sql += ` AND dq_status = @p2`;
+        sql += ` AND dq_status=@p${params.length + 1}`;
         params.push(status);
       }
 
       if (dq) {
-        if (dq.toLowerCase() === "ok")
-          sql += ` AND LOWER(CAST(dq_messages AS NVARCHAR(MAX))) LIKE '%"ok"%'`;
-        else if (dq.toLowerCase() === "warning")
-          sql += ` AND LOWER(CAST(dq_messages AS NVARCHAR(MAX))) LIKE '%"warning"%'`;
-        else if (dq.toLowerCase() === "error")
-          sql += ` AND LOWER(CAST(dq_messages AS NVARCHAR(MAX))) LIKE '%"error"%'`;
+        sql += ` AND LOWER(CAST(dq_messages AS NVARCHAR(MAX))) LIKE @p${
+          params.length + 1
+        }`;
+        params.push(`%"${dq.toLowerCase()}"%`);
       }
 
-      sql += ` ORDER BY cur_detail_id ASC OFFSET @p${
-        params.length + 1
-      } ROWS FETCH NEXT @p${params.length + 2} ROWS ONLY;`;
+      sql += `
+      ORDER BY cur_detail_id
+      OFFSET @p${params.length + 1} ROWS
+      FETCH NEXT @p${params.length + 2} ROWS ONLY;
+    `;
       params.push(offset, limit);
 
       const { rows } = await query(sql, params);
       res.json({ rows });
     } catch (err) {
-      console.error("❌ GET /reports/:reportNumber/rows error:", err);
+      console.error("❌ GET rows error:", err);
       next(err);
     }
   }
 );
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * UPDATE A SINGLE DETAIL ROW + AUDIT
- * ─────────────────────────────────────────────────────────────────────────────
- */
+
+/* ======================================================================
+   UPDATE SINGLE FIELD + AUDIT
+====================================================================== */
 router.put(
   "/reports/:reportNumber/row/:curDetailId",
   requireAuth,
@@ -242,82 +200,66 @@ router.put(
       const curDetailId = asInt(req.params.curDetailId);
       const { field_name, new_value, reason } = req.body || {};
 
-      if (!field_name)
-        return res.status(400).json({ error: "field_name is required" });
-
-      const colRes = await query(`
-        SELECT column_name
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE table_name = 'cur_invoice_detail';
-      `);
-      const validColumns = colRes.rows.map((r) => r.column_name);
-
-      if (!validColumns.includes(field_name)) {
-        return res.status(400).json({
-          error: `Invalid field: ${field_name}. Allowed: ${validColumns.join(
-            ", "
-          )}`,
-        });
+      if (!field_name) {
+        return res.status(400).json({ error: "field_name required" });
       }
 
+      const { rows: cols } = await query(`
+      SELECT column_name
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE table_name='cur_invoice_detail';
+    `);
+
+      const allowed = cols.map((c) => c.column_name);
       const readOnly = [
         "cur_detail_id",
         "report_number",
         "approved_by",
         "approved_at_utc",
-        "updated_at_utc",
         "created_at_utc",
+        "updated_at_utc",
       ];
-      if (readOnly.includes(field_name)) {
-        return res
-          .status(400)
-          .json({ error: `Field ${field_name} is read-only.` });
+
+      if (!allowed.includes(field_name) || readOnly.includes(field_name)) {
+        return res.status(400).json({ error: "Invalid or read-only field" });
       }
 
-      const oldRes = await query(
+      const { rows: oldRows } = await query(
         `SELECT CAST(${field_name} AS NVARCHAR(MAX)) AS old_value
-         FROM cur_invoice_detail
-         WHERE cur_detail_id=@p1 AND report_number=@p2;`,
+       FROM cur_invoice_detail
+       WHERE cur_detail_id=@p1 AND report_number=@p2`,
         [curDetailId, rn]
       );
-      if (!oldRes.rows.length)
-        return res.status(404).json({ error: "Row not found" });
-      const oldValue = oldRes.rows[0].old_value;
 
-      const updRes = await query(
+      if (!oldRows.length)
+        return res.status(404).json({ error: "Row not found" });
+
+      const { rows: updRows } = await query(
         `UPDATE cur_invoice_detail
-         SET ${field_name}=@p1, updated_at_utc=GETUTCDATE()
-         OUTPUT INSERTED.*
-         WHERE cur_detail_id=@p2 AND report_number=@p3;`,
+       SET ${field_name}=@p1, updated_at_utc=GETUTCDATE()
+       OUTPUT INSERTED.*
+       WHERE cur_detail_id=@p2 AND report_number=@p3`,
         [new_value, curDetailId, rn]
       );
 
       await query(
         `INSERT INTO audit_log
-         (report_number, row_key, field_name, old_value, new_value,
-          changed_by, change_reason, changed_at_utc)
-         VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,GETUTCDATE());`,
+       (report_number,row_key,field_name,old_value,new_value,changed_by,change_reason,changed_at_utc)
+       VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,GETUTCDATE())`,
         [
           rn,
           curDetailId,
           field_name,
-          oldValue,
+          oldRows[0].old_value,
           String(new_value ?? ""),
           req.user?.email || "internal",
           reason || "Manual correction",
         ]
       );
 
-      res.json({
-        ok: true,
-        message: `Field '${field_name}' updated successfully`,
-        row: updRes.rows[0],
-      });
+      res.json({ ok: true, row: updRows[0] });
     } catch (err) {
-      console.error(
-        "❌ PUT /reports/:reportNumber/row/:curDetailId error:",
-        err
-      );
+      console.error("❌ UPDATE row error:", err);
       next(err);
     }
   }

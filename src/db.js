@@ -4,35 +4,33 @@ import dotenv from "dotenv";
 dotenv.config();
 
 /**
- * Azure SQL Server connection config.
- * Uses explicit fields instead of DATABASE_URL because mssql:// URLs
- * are not supported by the "mssql" library.
+ * Azure SQL Server connection config
  */
 const sqlConfig = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   server: process.env.DB_SERVER,
-  port: parseInt(process.env.DB_PORT || "1433"),
+  port: parseInt(process.env.DB_PORT || "1433", 10),
+  connectionTimeout: 30000,
+  requestTimeout: 30000,
   options: {
-    encrypt: true, // ✅ Always use encryption for Azure SQL
-    trustServerCertificate: false, // ✅ Recommended for Azure SQL
+    encrypt: true,
+    trustServerCertificate: process.env.NODE_ENV !== "production",
   },
 };
 
-// ✅ Lazy pool initialization
 let poolPromise = null;
 
 /**
- * 🩹 Translate Postgres-style LIMIT N syntax to SQL Server TOP N syntax
- * This allows legacy queries to work until you migrate them fully.
+ * ⚠️ TEMP compatibility shim for legacy LIMIT syntax
+ * Logs warning so it can be removed later
  */
 function translateQueryForMSSQL(q) {
-  // Replace "SELECT ... LIMIT n" with "SELECT TOP n ..." only if LIMIT appears
   const limitRegex = /\bSELECT\b([\s\S]*?)\bLIMIT\s+(\d+)/i;
   if (limitRegex.test(q)) {
+    console.warn("⚠️ Legacy LIMIT detected — please migrate query:", q);
     return q.replace(limitRegex, (match, before, limitNum) => {
-      // Insert TOP right after SELECT and remove LIMIT
       return `SELECT TOP ${limitNum}${before}`;
     });
   }
@@ -40,19 +38,16 @@ function translateQueryForMSSQL(q) {
 }
 
 /**
- * Query helper (keeps same signature as pg)
- * @param {string} q - SQL query (use @p1, @p2 for parameters)
- * @param {Array} params - values for parameters
- * @returns {Object} { rows: [...] }
+ * Query helper
  */
 export async function query(q, params = []) {
   try {
     if (!poolPromise) {
       poolPromise = sql.connect(sqlConfig);
     }
+
     const pool = await poolPromise;
     const request = pool.request();
-
     const sqlText = translateQueryForMSSQL(q);
 
     params.forEach((val, idx) => {
@@ -63,24 +58,34 @@ export async function query(q, params = []) {
     return { rows: result.recordset, recordset: result.recordset };
   } catch (err) {
     console.error("❌ SQL query error:", err.message);
+
+    // Reset pool on fatal errors
+    if (
+      err.code === "ESOCKET" ||
+      err.code === "ETIMEOUT" ||
+      err.code === "ECONNCLOSED"
+    ) {
+      poolPromise = null;
+    }
+
     throw err;
   }
 }
 
 /**
- * Optional: test connection at startup
+ * Startup connectivity test
  */
 (async () => {
   try {
-    const test = await query("SELECT TOP 1 GETDATE() AS now");
-    console.log("✅ SQL Server connected:", test.rows[0].now);
+    const test = await query("SELECT TOP 1 GETUTCDATE() AS now");
+    console.log("✅ SQL Server connected (UTC):", test.rows[0].now);
   } catch (err) {
     console.error("❌ SQL Server connection failed:", err.message);
   }
 })();
 
 /**
- * Compatibility export (for code importing { pool } like pg)
+ * pg-style compatibility export
  */
 export const pool = {
   query: async (q, params = []) => query(q, params),
