@@ -1,16 +1,97 @@
+// src/routes/uploads.js
 import express from "express";
+import path from "path";
 import { requireAuth, safeParseUrl } from "../middleware/auth.js";
-import { pool } from "../db.js";
+import { query } from "../db.js";
 import { BlobServiceClient } from "@azure/storage-blob";
 
 const router = express.Router();
 
-/**
- * ==========================================================
- * POST /api/uploads/register
- * Save upload metadata after file upload (main: report_number)
- * ==========================================================
- */
+/* ============================================================================
+   Helpers
+============================================================================ */
+
+// Normalize any filename/blob name for comparison
+function normalizeName(input) {
+  if (!input) return "";
+
+  let s = String(input);
+
+  // take only last segment if it's a blob path
+  s = s.split("/").pop();
+
+  // decode any %xx encoding safely
+  try {
+    s = decodeURIComponent(s);
+  } catch {}
+
+  s = s.trim().toLowerCase();
+
+  // remove common timestamp prefixes like: 20260105_ or 2026-01-05t123000_
+  // also handles 2026-01-05T1937_ (your real example)
+  s = s.replace(/^(\d{4}[-]?\d{2}[-]?\d{2}(t?\d{3,})?[_-]+)/i, "");
+
+  // normalize separators: spaces, underscores, dashes -> single space
+  s = s.replace(/[\s_-]+/g, " ");
+
+  // remove punctuation except dot (keep extension)
+  s = s.replace(/[^\w.\s]/g, "");
+
+  // collapse multiple spaces
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
+
+function getContentTypeByExt(filename) {
+  const ext = (path.extname(filename || "").toLowerCase() || "").replace(
+    ".",
+    ""
+  );
+  const map = {
+    csv: "text/csv",
+    txt: "text/plain",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    xls: "application/vnd.ms-excel",
+    pdf: "application/pdf",
+    json: "application/json",
+  };
+  return map[ext] || "application/octet-stream";
+}
+
+async function findBlobByLooseName(
+  blobServiceClient,
+  containers,
+  requestedName
+) {
+  const reqNorm = normalizeName(requestedName);
+
+  for (const containerName of containers) {
+    const containerClient = blobServiceClient.getContainerClient(containerName);
+    if (!(await containerClient.exists())) continue;
+
+    // NOTE: This scans blobs; long term you should store container+blobName in DB
+    for await (const blob of containerClient.listBlobsFlat()) {
+      const blobNorm = normalizeName(blob.name);
+
+      // Exact normalized match is best
+      if (blobNorm === reqNorm) {
+        return { containerClient, blobName: blob.name };
+      }
+
+      // Loose contains match as fallback (helps when DB has display name)
+      if (blobNorm.includes(reqNorm) || reqNorm.includes(blobNorm)) {
+        return { containerClient, blobName: blob.name };
+      }
+    }
+  }
+
+  return null;
+}
+
+/* ============================================================================
+   POST /api/uploads/register
+============================================================================ */
 router.post("/register", requireAuth, async (req, res) => {
   try {
     const { filename, report_type = "Sales", note = "" } = req.body;
@@ -23,215 +104,243 @@ router.post("/register", requireAuth, async (req, res) => {
     const uploadedBy =
       user.user_type === "bp"
         ? user.email
-        : user.user_id?.toString() || user.username || user.email;
+        : String(user.user_id || user.username || user.email);
 
     const uploadedByName =
-      user.fullName || user.name || user.username || user.email;
+      user.display_name ||
+      user.fullName ||
+      user.name ||
+      user.username ||
+      user.email ||
+      "System";
 
     const uploadedByType = user.user_type || "internal";
 
-    // ✅ MSSQL INSERT with OUTPUT
     const sql = `
-      INSERT INTO report_number
-        (report_type, filename, uploaded_by, uploaded_at_utc, status, note, uploaded_by_name, uploaded_by_type)
-      OUTPUT INSERTED.report_number, INSERTED.report_type, INSERTED.filename,
-             INSERTED.uploaded_by, INSERTED.uploaded_at_utc, INSERTED.status,
-             INSERTED.uploaded_by_name, INSERTED.uploaded_by_type
+      INSERT INTO dbo.Report_Number
+      (
+        Report_Type,
+        Filename,
+        Uploaded_By,
+        Uploaded_At_UTC,
+        Status,
+        Note,
+        Uploaded_By_Name,
+        Uploaded_By_Type
+      )
+      OUTPUT
+        INSERTED.Report_Number,
+        INSERTED.Report_Type,
+        INSERTED.Filename,
+        INSERTED.Uploaded_By,
+        INSERTED.Uploaded_By_Name,
+        INSERTED.Uploaded_At_UTC,
+        INSERTED.Status,
+        INSERTED.Uploaded_By_Type
       VALUES
-        (@p1, @p2, @p3, GETDATE(), 'new', @p4, @p5, @p6);
+      (
+        @p1, @p2, @p3, GETUTCDATE(),
+        'new', @p4, @p5, @p6
+      );
     `;
 
     const params = [
-      report_type, // @p1
-      filename, // @p2
-      uploadedBy, // @p3
-      note, // @p4
-      uploadedByName, // @p5
-      uploadedByType, // @p6
+      report_type,
+      filename,
+      uploadedBy,
+      note,
+      uploadedByName,
+      uploadedByType,
     ];
 
-    const result = await pool.query(sql, params);
-
-    // ✅ Safe fallback for different MSSQL pool return formats
-    const inserted =
-      result?.recordset?.[0] ||
-      result?.recordsets?.[0]?.[0] ||
-      result?.rows?.[0] ||
-      null;
-
-    if (!inserted) {
-      console.warn("⚠️ Insert executed but no recordset returned:", result);
-      return res.status(200).json({
-        success: true,
-        message: "Upload registered (no result returned)",
-      });
-    }
-
-    console.log("✅ Upload registered:", inserted);
-    res.status(200).json({ success: true, data: inserted });
+    const { rows } = await query(sql, params);
+    res.json({ success: true, data: rows?.[0] });
   } catch (err) {
-    console.error("❌ /uploads/register error:", err.stack || err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ /uploads/register error:", err);
+    res.status(500).json({ error: "Failed to register upload" });
   }
 });
 
-/**
- * ==========================================================
- * GET /api/uploads/recent
- * Fetch last 20 uploads (admins see all)
- * ==========================================================
- */
+/* ============================================================================
+   GET /api/uploads/recent
+============================================================================ */
+/* ============================================================================
+   GET /api/uploads/recent
+   Rules:
+   - BP: only their uploads
+   - Internal Admin/Accounting/SSP_Admins: all uploads
+   - Other internal users: only their uploads
+============================================================================ */
 router.get("/recent", requireAuth, async (req, res) => {
   try {
-    // Parse query parameters safely
-    let url;
-    try {
-      url = safeParseUrl(req) || { searchParams: new URLSearchParams() };
-    } catch {
-      url = { searchParams: new URLSearchParams() };
-    }
-
-    const reportType = url.searchParams.get("report_type") || null;
+    const url = safeParseUrl(req);
+    const reportType = url.searchParams.get("report_type");
     const user = req.user;
 
-    // Normalize roles
-    const roles = Array.isArray(user.roles)
-      ? user.roles.map((r) => r.toLowerCase())
-      : [(user.role || "").toLowerCase()];
-    const isAdmin = roles.includes("admin");
+    const role = String(user.role || "")
+      .toLowerCase()
+      .trim();
 
-    const uploadedBy =
-      user.user_type === "bp"
-        ? user.email
-        : user.user_id?.toString() || user.username || user.email;
+    // ✅ privileged internal users see ALL uploads
+    const isPrivilegedInternal =
+      user.user_type === "internal" &&
+      ["admin", "accounting", "ssp_admins"].includes(role);
 
-    console.log("🔎 Fetching uploads for:", uploadedBy, "| Roles:", roles);
-    const dbCheck = await pool.query("SELECT DB_NAME() AS CurrentDB");
-    console.log("🧭 Connected to database:", dbCheck.rows?.[0]?.CurrentDB);
-
-    // ✅ Correct table & column names
     let sql = `
       SELECT TOP 20
-        Report_Number AS report_number,
-        Report_Type AS report_type,
-        FileName AS name,
-        Uploaded_By AS uploaded_by_name,
-        Uploaded_By_Name AS display_name,
-        Uploaded_At_UTC AS date,
-        Status AS status,
-        Uploaded_By_Type AS uploaded_by_type
+        Report_Number        AS report_number,
+        Report_Type          AS report_type,
+        Filename             AS filename,
+        Uploaded_By          AS uploaded_by,
+        ISNULL(Uploaded_By_Name, Uploaded_By) AS uploaded_by_name,
+        Uploaded_At_UTC      AS uploaded_at_utc,
+        Status               AS status,
+        Uploaded_By_Type     AS uploaded_by_type
       FROM dbo.Report_Number
     `;
 
     const params = [];
 
-    if (!isAdmin) {
-      sql += " WHERE LOWER(Uploaded_By) = LOWER(@p1)";
-      params.push(uploadedBy);
+    // ✅ Non-privileged users see ONLY their uploads
+    if (!isPrivilegedInternal) {
+      const uploadedByValue =
+        user.user_type === "bp"
+          ? String(user.email || "").trim()
+          : String(user.user_id || user.username || user.email || "").trim();
+
+      if (!uploadedByValue) {
+        return res.status(401).json({ error: "Missing user identity" });
+      }
+
+      sql += `
+        WHERE LOWER(Uploaded_By) = LOWER(@p1)
+      `;
+      params.push(uploadedByValue);
     }
 
+    // Optional report_type filter
     if (reportType) {
       sql += params.length ? " AND" : " WHERE";
-      sql += " Report_Type = @p2";
+      sql += ` Report_Type = @p${params.length + 1}`;
       params.push(reportType);
     }
 
     sql += " ORDER BY Uploaded_At_UTC DESC;";
 
-    console.log("📘 Executing SQL:", sql, "| Params:", params);
+    const { rows } = await query(sql, params);
 
-    const result = await pool.query(sql, params);
-    const rows = result?.recordset || [];
+    // ✅ include download_key so frontend can use report_number for download
+    const items = (rows || []).map((r) => ({
+      ...r,
+      download_key: r.report_number,
+    }));
 
-    console.log(`✅ Found ${rows.length} uploads | Admin: ${isAdmin}`);
-    res.json({ items: rows });
+    res.json({ items });
   } catch (err) {
-    console.error("❌ /uploads/recent error:", err.stack || err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ /uploads/recent error:", err);
+    res.status(500).json({ error: "Failed to fetch uploads" });
   }
 });
 
-/**
- * ==========================================================
- * GET /api/uploads/download/:filename
- * Azure Blob secure file download
- * ==========================================================
- */
-router.get("/download/:filename", requireAuth, async (req, res) => {
+/* ============================================================================
+   GET /api/uploads/download/:fileKey
+   - fileKey can be report_number (numeric) OR filename (string)
+============================================================================ */
+router.get("/download/:fileKey", requireAuth, async (req, res) => {
   try {
-    let { filename } = req.params;
-    if (!filename) return res.status(400).json({ error: "Missing filename" });
+    const rawKey = req.params.fileKey;
+    if (!rawKey) return res.status(400).json({ error: "Missing file key" });
 
-    const connStr = process.env.AZURE_STORAGE_CONNECTION_STRING;
-    const blobServiceClient = BlobServiceClient.fromConnectionString(connStr);
-
-    // ✅ Try all likely containers
-    const containers = ["ssp-reports", "members", "suppliers", "internal"];
-    let containerClient = null;
-
-    for (const name of containers) {
-      const c = blobServiceClient.getContainerClient(name);
-      if (await c.exists()) {
-        containerClient = c;
-        console.log(`✅ Using Azure container: ${name}`);
-        break;
+    const keyDecoded = (() => {
+      try {
+        return decodeURIComponent(rawKey).trim();
+      } catch {
+        return String(rawKey).trim();
       }
-    }
+    })();
 
-    if (!containerClient) {
-      return res.status(500).json({ error: "No valid Azure container found" });
-    }
+    console.log("📥 [DOWNLOAD] request key:", keyDecoded);
 
-    filename = decodeURIComponent(filename).trim().toLowerCase();
-    const normalizedSearch = filename.replace(/\s+/g, "_");
+    // 1) If numeric -> treat as report_number and fetch filename from DB
+    let requestedFilename = keyDecoded;
 
-    console.log(`🔍 Searching Azure for: ${normalizedSearch}`);
+    if (/^\d+$/.test(keyDecoded)) {
+      const reportNumber = Number(keyDecoded);
 
-    const matches = [];
-    for await (const blob of containerClient.listBlobsFlat()) {
-      const blobName = blob.name.toLowerCase();
-      const shortName = blobName.split("/").pop();
-      const cleaned = shortName.replace(
-        /^(\d{4}[-]?\d{2}[-]?\d{2}t?\d{6,}_)/i,
-        ""
+      const { rows } = await query(
+        `
+        SELECT TOP 1 Filename
+        FROM dbo.Report_Number
+        WHERE Report_Number = @p1
+        ORDER BY Uploaded_At_UTC DESC;
+        `,
+        [reportNumber]
       );
-      const normalizedBlob = cleaned.replace(/\s+/g, "_").toLowerCase();
 
-      if (normalizedBlob.includes(normalizedSearch)) {
-        matches.push({
-          fullPath: blob.name,
-          lastModified: blob.properties.lastModified,
-        });
+      if (!rows?.length) {
+        return res.status(404).json({ error: "Report not found" });
       }
+
+      requestedFilename = rows[0].Filename;
+      console.log(
+        "📥 [DOWNLOAD] report_number -> filename:",
+        requestedFilename
+      );
     }
 
-    if (matches.length === 0) {
+    // 2) Find in Azure Blob (loose match)
+    const conn = process.env.AZURE_STORAGE_CONNECTION_STRING;
+    if (!conn) {
       return res
-        .status(404)
-        .json({ error: `File "${filename}" not found in Azure.` });
+        .status(500)
+        .json({ error: "Azure storage connection missing" });
     }
 
-    matches.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
-    const blobClient = containerClient.getBlobClient(matches[0].fullPath);
-    const downloadResponse = await blobClient.download();
+    const blobServiceClient = BlobServiceClient.fromConnectionString(conn);
 
-    const ext = filename.split(".").pop().toLowerCase();
-    const mimeMap = {
-      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      xls: "application/vnd.ms-excel",
-      csv: "text/csv",
-      pdf: "application/pdf",
-      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      doc: "application/msword",
-      zip: "application/zip",
-      txt: "text/plain",
-    };
+    // ✅ FIX: include dataintegration (your blob is here)
+    // Use env to control in each environment
+    const containers = (
+      process.env.AZURE_DOWNLOAD_CONTAINERS ||
+      "dataintegration,ssp-reports,members,suppliers,internal"
+    )
+      .split(",")
+      .map((c) => c.trim())
+      .filter(Boolean);
 
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.setHeader("Content-Type", mimeMap[ext] || "application/octet-stream");
-    downloadResponse.readableStreamBody.pipe(res);
+    const found = await findBlobByLooseName(
+      blobServiceClient,
+      containers,
+      requestedFilename
+    );
+
+    if (!found) {
+      console.warn("📥 [DOWNLOAD] NOT FOUND for:", requestedFilename, {
+        normalized: normalizeName(requestedFilename),
+        containers,
+      });
+      return res.status(404).json({ error: "File not found" });
+    }
+
+    const { containerClient, blobName } = found;
+    console.log("📥 [DOWNLOAD] matched blob:", {
+      container: containerClient.containerName,
+      blobName,
+      blobNorm: normalizeName(blobName),
+      reqNorm: normalizeName(requestedFilename),
+    });
+
+    const blobClient = containerClient.getBlobClient(blobName);
+    const download = await blobClient.download();
+
+    const finalName = requestedFilename || blobName.split("/").pop();
+
+    res.setHeader("Content-Disposition", `attachment; filename="${finalName}"`);
+    res.setHeader("Content-Type", getContentTypeByExt(finalName));
+
+    download.readableStreamBody.pipe(res);
   } catch (err) {
-    console.error("❌ /uploads/download error:", err.stack || err.message);
+    console.error("❌ /uploads/download error:", err);
     res.status(500).json({ error: "Failed to download file" });
   }
 });

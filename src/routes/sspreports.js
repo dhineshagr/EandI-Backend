@@ -5,14 +5,10 @@ import { requireInternalAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 
-/**
- * GET /api/ssp/reports
- * Enhanced SSP Dashboard API
- * - Filters by Supplier, Contract, Member
- * - Totals: Purchase$, CAF$
- * - Counts: Passed, Failed, Approved
- * - Report status
- */
+/* ======================================================================
+   GET /api/ssp/reports
+   SSP Dashboard API
+====================================================================== */
 router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
   try {
     const {
@@ -29,10 +25,13 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       limit = 25,
     } = req.query;
 
-    const pageNum = parseInt(page, 10) || 1;
-    const pageSize = parseInt(limit, 10) || 25;
+    const pageNum = Number(page) || 1;
+    const pageSize = Number(limit) || 25;
     const offset = (pageNum - 1) * pageSize;
 
+    /* --------------------------------------------------
+       Sorting whitelist
+    -------------------------------------------------- */
     const validSortFields = [
       "report_number",
       "report_type",
@@ -48,62 +47,73 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     ];
 
     const sortField = validSortFields.includes(sort) ? sort : "uploaded_at_utc";
-
     const sortOrder = order === "asc" ? "ASC" : "DESC";
 
+    /* --------------------------------------------------
+       Dynamic filters
+    -------------------------------------------------- */
     const conditions = [];
     const values = [];
     let idx = 1;
 
-    // Global search
     if (search) {
       conditions.push(`
-        (CAST(h.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
-        OR rn.Filename LIKE @p${idx}
-        OR rn.Uploaded_By LIKE @p${idx})
+        (
+          CAST(h.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
+          OR rn.Filename LIKE @p${idx}
+          OR rn.Uploaded_By LIKE @p${idx}
+        )
       `);
       values.push(`%${search}%`);
       idx++;
     }
 
-    // Filter by supplier (bp_code)
     if (supplier) {
       conditions.push(`h.BP_Code = @p${idx}`);
       values.push(supplier);
       idx++;
     }
 
-    // Filter by contract
     if (contract) {
       conditions.push(`h.Contract_ID = @p${idx}`);
       values.push(contract);
       idx++;
     }
 
-    // Filter by member
     if (member) {
       conditions.push(`d.Member_Number LIKE @p${idx}`);
       values.push(`%${member}%`);
       idx++;
     }
 
-    // Date filters
-    if (startDate && endDate) {
+    if (startDate || endDate) {
       const dateColumn =
         dateType === "Approved_At_Utc"
           ? "h.Approved_At_Utc"
           : "rn.Uploaded_At_Utc";
 
-      conditions.push(`${dateColumn} BETWEEN @p${idx} AND @p${idx + 1}`);
-      values.push(startDate, endDate);
-      idx += 2;
+      if (startDate && endDate) {
+        conditions.push(`${dateColumn} BETWEEN @p${idx} AND @p${idx + 1}`);
+        values.push(startDate, endDate);
+        idx += 2;
+      } else if (startDate) {
+        conditions.push(`${dateColumn} >= @p${idx}`);
+        values.push(startDate);
+        idx++;
+      } else if (endDate) {
+        conditions.push(`${dateColumn} <= @p${idx}`);
+        values.push(endDate);
+        idx++;
+      }
     }
 
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-    // Main query
-    const queryStr = `
+    /* --------------------------------------------------
+       Main query
+    -------------------------------------------------- */
+    const sql = `
       WITH base AS (
         SELECT
           h.Report_Number AS report_number,
@@ -113,9 +123,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           rn.Uploaded_At_Utc AS uploaded_at_utc,
           h.Report_Status AS report_status,
 
-          SUM(CASE WHEN d.DQ_Status = 'PASSED' THEN 1 ELSE 0 END) AS passed_count,
-          SUM(CASE WHEN d.DQ_Status = 'FAILED' THEN 1 ELSE 0 END) AS failed_count,
-          SUM(CASE WHEN d.DQ_Status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+          SUM(CASE WHEN LOWER(d.DQ_Status) = 'passed' THEN 1 ELSE 0 END) AS passed_count,
+          SUM(CASE WHEN LOWER(d.DQ_Status) = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN LOWER(d.DQ_Status) = 'approved' THEN 1 ELSE 0 END) AS approved_count,
 
           SUM(CAST(d.Purchase_Dollars_Calc AS FLOAT)) AS total_purchase,
           SUM(CAST(d.CAF_Dollars AS FLOAT)) AS total_caf
@@ -124,7 +134,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
         JOIN Cur_Invoice_Detail d ON d.Report_Number = h.Report_Number
         JOIN Report_Number rn ON rn.Report_Number = h.Report_Number
         ${whereClause}
-        GROUP BY 
+        GROUP BY
           h.Report_Number,
           rn.Report_Type,
           rn.Filename,
@@ -138,10 +148,12 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       OFFSET @p${idx} ROWS FETCH NEXT @p${idx + 1} ROWS ONLY;
     `;
 
-    const results = await query(queryStr, [...values, offset, pageSize]);
+    const { rows } = await query(sql, [...values, offset, pageSize]);
 
-    // Count for pagination
-    const countQuery = `
+    /* --------------------------------------------------
+       Count query (mirrors filters exactly)
+    -------------------------------------------------- */
+    const countSql = `
       SELECT COUNT(*) AS total FROM (
         SELECT h.Report_Number
         FROM Cur_Invoice_Header h
@@ -149,25 +161,25 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
         JOIN Report_Number rn ON rn.Report_Number = h.Report_Number
         ${whereClause}
         GROUP BY h.Report_Number
-      ) AS t;
+      ) t;
     `;
-    const countResult = await query(countQuery, values);
+    const countResult = await query(countSql, values);
 
     res.json({
-      reports: results.rows,
-      total: countResult.rows[0].total,
+      reports: rows,
+      total: countResult.rows[0]?.total || 0,
       page: pageNum,
       limit: pageSize,
     });
   } catch (err) {
-    console.error("❌ Error:", err);
-    res.status(500).json({ error: "Failed to load SSP reports." });
+    console.error("❌ SSP reports error:", err);
+    res.status(500).json({ error: "Failed to load SSP reports" });
   }
 });
 
-/**
- * Download full VRF detail CSV for a report
- */
+/* ======================================================================
+   DOWNLOAD VRF DETAIL CSV
+====================================================================== */
 router.get(
   "/ssp/reports/:report_number/download",
   requireInternalAuth,
@@ -175,28 +187,24 @@ router.get(
     try {
       const { report_number } = req.params;
 
-      const detailQuery = `
-        SELECT *
-        FROM Cur_Invoice_Detail
-        WHERE Report_Number = @p1
-      `;
-      const result = await query(detailQuery, [report_number]);
+      const { rows } = await query(
+        `SELECT * FROM Cur_Invoice_Detail WHERE Report_Number=@p1`,
+        [report_number]
+      );
 
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Report not found." });
+      if (!rows.length) {
+        return res.status(404).json({ error: "Report not found" });
       }
 
-      // Build CSV
-      const headers = Object.keys(result.rows[0]).join(",");
-      const rows = result.rows
-        .map((row) =>
-          Object.values(row)
-            .map((v) => `"${v ?? ""}"`)
-            .join(",")
-        )
-        .join("\n");
+      const escapeCsv = (v) =>
+        `"${String(v ?? "")
+          .replace(/"/g, '""')
+          .replace(/\n/g, " ")}"`;
 
-      const csv = `${headers}\n${rows}`;
+      const headers = Object.keys(rows[0]).join(",");
+      const body = rows
+        .map((r) => Object.values(r).map(escapeCsv).join(","))
+        .join("\n");
 
       res.setHeader("Content-Type", "text/csv");
       res.setHeader(
@@ -204,10 +212,10 @@ router.get(
         `attachment; filename=vrf_report_${report_number}.csv`
       );
 
-      res.send(csv);
+      res.send(`${headers}\n${body}`);
     } catch (err) {
-      console.error("❌ CSV download error:", err);
-      res.status(500).json({ error: "Failed to download report CSV." });
+      console.error("❌ VRF CSV error:", err);
+      res.status(500).json({ error: "Failed to download report CSV" });
     }
   }
 );

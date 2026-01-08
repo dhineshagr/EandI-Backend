@@ -1,235 +1,133 @@
 // src/routes/auth.js
 import { Router } from "express";
-import { bpLogin } from "../middleware/auth.js";
-import { query } from "../db.js";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import jwksClient from "jwks-rsa";
-import axios from "axios";
+import passport from "passport";
 
 const router = Router();
-const tenantId = process.env.AZURE_TENANT_ID;
-const audience = process.env.AZURE_API_AUDIENCE;
-const jwtSecret = process.env.JWT_SECRET || "changeme";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
-const issuers = [
-  `https://sts.windows.net/${tenantId}/`,
-  `https://login.microsoftonline.com/${tenantId}/v2.0`,
-];
+// Turn on while debugging SAML callback issues
+const DEBUG_SAML = true;
 
-const client = jwksClient({
-  jwksUri: `https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`,
-});
-
-function getKey(header, callback) {
-  client.getSigningKey(header.kid, (err, key) => {
-    if (err) return callback(err);
-    callback(null, key.getPublicKey());
-  });
+function samlDbg(label, obj) {
+  if (!DEBUG_SAML) return;
+  console.log(`🧩 [SAML DEBUG] ${label}`, obj);
 }
 
-/** Decode any token (BP/SQL HS256 OR Entra RS256) */
-function decodeToken(token) {
-  return new Promise((resolve, reject) => {
-    try {
-      const decoded = jwt.verify(token, jwtSecret);
-      return resolve(decoded);
-    } catch (err) {
-      // try RS256
+/**
+ * Start SAML Login
+ * GET /api/auth/saml/login
+ */
+router.get("/saml/login", (req, res, next) => {
+  samlDbg("START LOGIN", {
+    url: req.originalUrl,
+    host: req.get("host"),
+    origin: req.get("origin"),
+  });
+
+  return passport.authenticate("saml")(req, res, next);
+});
+
+/**
+ * SAML Callback
+ * POST /api/auth/saml/callback
+ *
+ * ✅ This version:
+ * - Logs WHY SAML is failing (err/info)
+ * - Calls req.login(user) so passport stores session properly
+ * - Stores a flat user at req.session.user (your middleware expects this)
+ */
+router.post("/saml/callback", (req, res, next) => {
+  passport.authenticate("saml", (err, user, info) => {
+    if (err || !user) {
+      console.error("❌ SAML CALLBACK FAILED", {
+        err: err?.message || err,
+        info,
+      });
+
+      // Helpful extra debugging
+      samlDbg("CALLBACK REQUEST META", {
+        method: req.method,
+        url: req.originalUrl,
+        origin: req.get("origin"),
+        host: req.get("host"),
+        hasSession: Boolean(req.session),
+        hasBody: Boolean(req.body),
+        bodyKeys: req.body ? Object.keys(req.body) : [],
+      });
+
+      return res.redirect(`${FRONTEND_URL}/login`);
     }
 
-    jwt.verify(
-      token,
-      getKey,
-      { audience, algorithms: ["RS256"] },
-      (err, decoded) => {
-        if (err) return reject(err);
-        if (!issuers.includes(decoded.iss)) {
-          return reject(new Error("Invalid issuer"));
+    // ✅ At this point SAML succeeded and we have a user profile
+    samlDbg("SAML USER (from strategy verify)", {
+      email: user.email,
+      name: user.name,
+      groupsType: Array.isArray(user.groups) ? "array" : typeof user.groups,
+      groupsCount: Array.isArray(user.groups) ? user.groups.length : undefined,
+    });
+
+    // (Optional) regenerate session to prevent stale session issues
+    const finishLogin = () => {
+      // ✅ Ensure passport session is established
+      req.login(user, (loginErr) => {
+        if (loginErr) {
+          console.error("❌ req.login failed:", loginErr);
+          return next(loginErr);
         }
-        resolve(decoded);
-      }
-    );
+
+        // ✅ Keep YOUR app’s flat session copy
+        req.session.user = user;
+        req.session.authenticated = true;
+
+        // ✅ Make sure cookie gets written
+        req.session.save((saveErr) => {
+          if (saveErr) {
+            console.error("❌ session.save error:", saveErr);
+            return next(saveErr);
+          }
+
+          samlDbg("LOGIN COMPLETE", {
+            sessionUserEmail:
+              req.session?.user?.email ||
+              req.session?.passport?.user?.email ||
+              null,
+            hasPassport: Boolean(req.session?.passport),
+          });
+
+          return res.redirect(`${FRONTEND_URL}/`);
+        });
+      });
+    };
+
+    // Regenerate only if session exists
+    if (req.session?.regenerate) {
+      req.session.regenerate((regenErr) => {
+        if (regenErr) {
+          console.error("❌ session.regenerate error:", regenErr);
+          // continue without blocking
+          return finishLogin();
+        }
+        return finishLogin();
+      });
+    } else {
+      return finishLogin();
+    }
+  })(req, res, next);
+});
+
+/**
+ * Logout
+ * GET /api/auth/logout
+ */
+router.get("/logout", (req, res) => {
+  try {
+    if (typeof req.logout === "function") req.logout(() => {});
+  } catch {}
+
+  req.session?.destroy(() => {
+    res.clearCookie("eandi.sid");
+    res.redirect(`${FRONTEND_URL}/login`);
   });
-}
-
-/** 🔹 BP login */
-router.post("/bp-login", async (req, res, next) => {
-  try {
-    const { username, password } = req.body;
-    const { token, profile } = await bpLogin(username, password);
-    res.json({ token, user: profile });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/** 🔹 Internal SQL user login */
-router.post("/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ error: "Username and password required" });
-    }
-
-    const { rows } = await query(
-      `SELECT user_id, username, display_name, email, role, password_hash, is_active, user_type, bp_code
-       FROM users WHERE username=@p1;`,
-      [username]
-    );
-
-    if (!rows.length)
-      return res.status(401).json({ error: "Invalid username or password" });
-
-    const user = rows[0];
-    if (!user.is_active)
-      return res.status(403).json({ error: "Account disabled" });
-
-    const isValid = await bcrypt.compare(password, user.password_hash);
-    if (!isValid)
-      return res.status(401).json({ error: "Invalid username or password" });
-
-    const token = jwt.sign(
-      {
-        sub: `internal:${user.user_id}`,
-        id: user.user_id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        user_type: user.user_type || "internal",
-        bp_code: user.bp_code || null,
-      },
-      jwtSecret,
-      { expiresIn: "8h" }
-    );
-
-    res.json({
-      token,
-      user: {
-        id: user.user_id,
-        username: user.username,
-        fullName: user.display_name || user.username,
-        email: user.email,
-        role: user.role,
-        user_type: user.user_type || "internal",
-        bp_code: user.bp_code || null,
-      },
-    });
-  } catch (err) {
-    console.error("❌ /auth/login error:", err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
-
-/** 🔹 Entra/MSAL login (exchange idToken → local JWT) */
-router.post("/entra-login", async (req, res) => {
-  try {
-    const { idToken } = req.body;
-    if (!idToken) return res.status(400).json({ error: "Missing idToken" });
-
-    const decoded = jwt.decode(idToken);
-    if (!decoded) return res.status(401).json({ error: "Invalid idToken" });
-
-    const email = decoded.preferred_username || decoded.upn;
-    const fullName = decoded.name || email;
-    const role = decoded.roles?.[0] || "internal";
-
-    const localToken = jwt.sign(
-      {
-        typ: "local",
-        sub: `entra:${decoded.oid}`,
-        email,
-        name: fullName,
-        role,
-        user_type: "internal",
-      },
-      jwtSecret,
-      { expiresIn: "8h" }
-    );
-
-    res.json({
-      token: localToken,
-      user: {
-        username: email,
-        fullName,
-        email,
-        role,
-        user_type: "internal",
-      },
-    });
-  } catch (err) {
-    console.error("❌ /auth/entra-login error:", err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
-
-/** 🔹 Azure token exchange (authorization_code or refresh_token) */
-router.post("/azure/token", async (req, res) => {
-  try {
-    const {
-      code,
-      redirectUri,
-      refresh_token,
-      grant_type = code ? "authorization_code" : "refresh_token",
-    } = req.body;
-
-    if (!process.env.AZURE_CLIENT_ID || !process.env.AZURE_CLIENT_SECRET) {
-      return res
-        .status(500)
-        .json({ error: "Azure app credentials missing in environment" });
-    }
-
-    const params = new URLSearchParams({
-      client_id: process.env.AZURE_CLIENT_ID,
-      client_secret: process.env.AZURE_CLIENT_SECRET,
-      scope:
-        "openid profile email offline_access api://e5614425-4dbe-4f35-b725-64b9a2b92827/.default",
-      grant_type,
-    });
-
-    if (grant_type === "authorization_code") {
-      if (!code || !redirectUri)
-        return res.status(400).json({ error: "Missing code or redirectUri" });
-      params.append("code", code);
-      params.append("redirect_uri", redirectUri);
-    } else if (grant_type === "refresh_token") {
-      if (!refresh_token)
-        return res.status(400).json({ error: "Missing refresh_token" });
-      params.append("refresh_token", refresh_token);
-    }
-
-    const tenant = process.env.AZURE_TENANT_ID;
-    const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-
-    const response = await axios.post(tokenUrl, params.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    });
-
-    res.json(response.data);
-  } catch (err) {
-    console.error(
-      "❌ Azure token exchange failed:",
-      err.response?.data || err.message
-    );
-    res
-      .status(err.response?.status || 500)
-      .json(err.response?.data || { error: err.message });
-  }
-});
-
-/** 🔹 Current logged-in user */
-router.get("/me", async (req, res) => {
-  try {
-    const hdr = req.headers.authorization || "";
-    const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "Missing token" });
-
-    const decoded = await decodeToken(token);
-    res.json({ user: decoded });
-  } catch (err) {
-    console.error("❌ /auth/me error:", err.message);
-    res.status(401).json({ error: "Invalid token" });
-  }
 });
 
 export default router;
