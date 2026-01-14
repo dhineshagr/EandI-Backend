@@ -188,7 +188,7 @@ app.use("/api", sspReportsRoutes);
 app.use("/api/notify-accounting", notifyAccounting);
 app.use("/api", me);
 
-/* 404 */
+/* 404 error*/
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
 /* Error handler */
