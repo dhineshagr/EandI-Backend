@@ -63,7 +63,7 @@ app.use(
     proxy: true,
     cookie: {
       httpOnly: true,
-      secure: isProd, // ✅ true in Azure
+      secure: isProd, // ✅ true in Azure (HTTPS)
       sameSite: isProd ? "none" : "lax", // ✅ cross-site cookies for SAML in prod
       maxAge: 8 * 60 * 60 * 1000,
     },
@@ -74,36 +74,97 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-/* ✅ CORS */
-const allowedOrigins = (process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
+/* ======================================================
+   ✅ CORS (FIXED for Okta tile + SAML)
+   - Allows your frontend origins from CORS_ORIGIN
+   - Allows *.okta.com / *.oktapreview.com
+   - ✅ Never blocks /api/auth/saml/* (Okta tile hits these with Origin header)
+====================================================== */
 
-if (!allowedOrigins.length && !isProd) {
-  allowedOrigins.push("http://localhost:5173");
+const allowedOrigins = new Set(
+  (process.env.CORS_ORIGIN || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean)
+);
+
+// Optional: also allow FRONTEND_BASE_URL origin (if set)
+if (process.env.FRONTEND_BASE_URL) {
+  try {
+    allowedOrigins.add(new URL(process.env.FRONTEND_BASE_URL).origin);
+  } catch {
+    // ignore bad url
+  }
 }
 
+if (!isProd) {
+  allowedOrigins.add("http://localhost:5173");
+  allowedOrigins.add("http://localhost:3001");
+}
+
+function isOktaOrigin(origin) {
+  try {
+    const { hostname } = new URL(origin);
+    return (
+      hostname.endsWith(".okta.com") || hostname.endsWith(".oktapreview.com")
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Request-aware CORS delegate (lets us bypass SAML endpoints)
 app.use(
-  cors({
-    origin(origin, cb) {
-      // server-to-server
-      if (!origin) return cb(null, true);
+  cors((req, cb) => {
+    const origin = req.header("Origin");
 
-      // browsers sometimes send Origin: "null"
-      if (origin === "null") {
-        if (!isProd) return cb(null, true);
-        return cb(new Error("Not allowed by CORS: null"), false);
-      }
+    // Server-to-server / top-level navigation (no Origin header)
+    if (!origin) {
+      return cb(null, {
+        origin: true,
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+      });
+    }
 
-      if (allowedOrigins.includes(origin)) return cb(null, true);
+    // ✅ Never block SAML endpoints (Okta tile can send Origin: https://eandi.okta.com)
+    // Note: req.path does NOT include query string.
+    if (req.path.startsWith("/api/auth/saml")) {
+      return cb(null, {
+        origin: true,
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+      });
+    }
 
-      return cb(new Error(`Not allowed by CORS: ${origin}`), false);
-    },
-    credentials: true,
+    // browsers sometimes send Origin: "null"
+    if (origin === "null") {
+      return cb(null, {
+        origin: !isProd,
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+      });
+    }
+
+    // Allow explicit allow-list OR Okta domains
+    if (allowedOrigins.has(origin) || isOktaOrigin(origin)) {
+      return cb(null, {
+        origin: true,
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+      });
+    }
+
+    // Block everything else
+    return cb(new Error(`Not allowed by CORS: ${origin}`), { origin: false });
   })
 );
 
+// ✅ IMPORTANT: preflight must use SAME cors delegate
 app.options("*", cors());
 
 /* Logging */

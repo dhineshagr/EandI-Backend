@@ -18,23 +18,34 @@ const asInt = (v, d = 0) => {
 router.post("/reports/register", requireAuth, async (req, res, next) => {
   try {
     const { filename, report_type = "Sales", note = "" } = req.body || {};
-    if (!filename) {
+    if (!filename)
       return res.status(400).json({ error: "filename is required" });
-    }
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
+    // ✅ prefer display_name if available, else username/email
+    const uploaded_by_name =
+      req.user?.display_name ||
+      req.user?.name ||
+      req.user?.username ||
+      (req.user?.email ? req.user.email.split("@")[0] : "Unknown");
+
+    const uploaded_by_type = req.user?.user_type || "internal";
+
     const sql = `
       INSERT INTO report_number
-        (filename, report_type, uploaded_by, uploaded_at_utc, status, note, created_at_utc, updated_at_utc)
+        (filename, report_type, uploaded_by, uploaded_by_name, uploaded_by_type,
+         uploaded_at_utc, status, note, created_at_utc, updated_at_utc)
       OUTPUT INSERTED.*
-      VALUES (@p1, @p2, @p3, GETUTCDATE(), 'new', @p4, GETUTCDATE(), GETUTCDATE());
+      VALUES (@p1, @p2, @p3, @p4, @p5, GETUTCDATE(), 'new', @p6, GETUTCDATE(), GETUTCDATE());
     `;
 
     const { rows } = await query(sql, [
       filename,
       report_type,
       uploaded_by,
+      uploaded_by_name,
+      uploaded_by_type,
       note,
     ]);
 
@@ -64,8 +75,15 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.report_number,
         r.filename,
         r.report_type,
+
+        -- keep original values (for debugging / exports)
         r.uploaded_by,
         r.uploaded_at_utc,
+
+        -- ✅ preferred display value for UI
+        COALESCE(NULLIF(r.uploaded_by_name, ''), NULLIF(r.uploaded_by, ''), 'System') AS uploaded_by_display,
+        r.uploaded_by_name,
+        r.uploaded_by_type,
 
         COUNT(d.cur_detail_id) AS total_rows,
         SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) AS passed_count,
@@ -74,18 +92,39 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) AS validated_count,
 
         CASE
+          -- ✅ ZERO SALES: treat as submitted/approved (no detail rows expected)
+          WHEN UPPER(LTRIM(RTRIM(r.filename))) = 'ZERO_SALES'
+            OR UPPER(LTRIM(RTRIM(r.filename))) LIKE 'ZERO_SALES%' THEN 'submitted'
+
+          -- Any failed row => Failed
           WHEN SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
+
+          -- All rows approved => Approved
           WHEN COUNT(d.cur_detail_id) > 0
-               AND SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'approved'
-          WHEN SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) > 0 THEN 'passed'
+           AND SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'approved'
+
+          -- ✅ All rows passed => Passed
+          WHEN COUNT(d.cur_detail_id) > 0
+           AND SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'passed'
+
+          -- Any validated => Validated (only if not failed/approved/passed)
           WHEN SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'validated'
+
+          -- ✅ No detail rows yet => Pending
           ELSE 'pending'
         END AS status
+
       FROM report_number r
       LEFT JOIN cur_invoice_detail d
         ON d.report_number = r.report_number
       GROUP BY
-        r.report_number, r.filename, r.report_type, r.uploaded_by, r.uploaded_at_utc
+        r.report_number,
+        r.filename,
+        r.report_type,
+        r.uploaded_by,
+        r.uploaded_by_name,
+        r.uploaded_by_type,
+        r.uploaded_at_utc
       ORDER BY r.uploaded_at_utc DESC;
     `;
 
