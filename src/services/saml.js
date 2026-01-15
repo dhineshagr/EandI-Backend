@@ -31,7 +31,26 @@ if (!OKTA_X509_CERT) throw new Error("❌ Missing env: OKTA_X509_CERT");
 
 /* ------------------------------------------------------
    Helpers
+------------------------------------------------------ */ /* ------------------------------------------------------
+   Helpers – normalize Okta cert (BASE64 → PEM)
 ------------------------------------------------------ */
+function normalizeOktaCert(raw) {
+  if (!raw) return raw;
+
+  let v = raw.trim();
+
+  // Case 1: already PEM → just fix newlines
+  if (v.includes("BEGIN CERTIFICATE")) {
+    return v.replace(/\\n/g, "\n").trim();
+  }
+
+  // Case 2: raw base64 from Okta metadata
+  v = v.replace(/\s+/g, "");
+  const lines = v.match(/.{1,64}/g)?.join("\n") || v;
+
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
+
 function asArray(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
