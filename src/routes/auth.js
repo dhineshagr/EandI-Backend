@@ -3,10 +3,40 @@ import { Router } from "express";
 import passport from "passport";
 
 const router = Router();
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+/**
+ * ======================================================
+ * ENV
+ * ======================================================
+ * Prefer these envs (set in Azure App Settings):
+ *  - FRONTEND_BASE_URL            = https://<frontend>.azurewebsites.net
+ *  - FRONTEND_SUCCESS_REDIRECT    = https://<frontend>.azurewebsites.net/upload   (or /)
+ *
+ * Backward compatibility:
+ *  - FRONTEND_URL                 (older name)
+ */
+const FRONTEND_BASE_URL = (
+  process.env.FRONTEND_BASE_URL ||
+  process.env.FRONTEND_URL ||
+  ""
+)
+  .trim()
+  .replace(/\/+$/, "");
+
+if (!FRONTEND_BASE_URL) {
+  // fail fast (prevents accidental localhost redirects)
+  throw new Error("Missing FRONTEND_BASE_URL (or FRONTEND_URL) env var");
+}
+
+const FRONTEND_SUCCESS_REDIRECT = (
+  process.env.FRONTEND_SUCCESS_REDIRECT || `${FRONTEND_BASE_URL}/`
+).trim();
+
+const FRONTEND_LOGIN_REDIRECT = `${FRONTEND_BASE_URL}/login`;
 
 // Turn on while debugging SAML callback issues
-const DEBUG_SAML = true;
+const DEBUG_SAML =
+  String(process.env.DEBUG_SAML || "true").toLowerCase() === "true";
 
 function samlDbg(label, obj) {
   if (!DEBUG_SAML) return;
@@ -14,8 +44,92 @@ function samlDbg(label, obj) {
 }
 
 /**
+ * ======================================================
+ * Shared SAML callback handler
+ * ======================================================
+ * Used by BOTH:
+ *  - POST /api/auth/saml/callback   (correct ACS endpoint)
+ *  - POST /api/auth/saml/login      (safety alias if Okta posts here)
+ */
+function handleSamlCallback(req, res, next) {
+  passport.authenticate("saml", (err, user, info) => {
+    if (err || !user) {
+      console.error("❌ SAML CALLBACK FAILED", {
+        err: err?.message || err,
+        info,
+      });
+
+      samlDbg("CALLBACK REQUEST META", {
+        method: req.method,
+        url: req.originalUrl,
+        origin: req.get("origin"),
+        host: req.get("host"),
+        hasSession: Boolean(req.session),
+        hasBody: Boolean(req.body),
+        bodyKeys: req.body ? Object.keys(req.body) : [],
+      });
+
+      return res.redirect(FRONTEND_LOGIN_REDIRECT);
+    }
+
+    samlDbg("SAML USER (from strategy verify)", {
+      email: user.email,
+      name: user.name,
+      groupsType: Array.isArray(user.groups) ? "array" : typeof user.groups,
+      groupsCount: Array.isArray(user.groups) ? user.groups.length : undefined,
+    });
+
+    const finishLogin = () => {
+      req.login(user, (loginErr) => {
+        if (loginErr) {
+          console.error("❌ req.login failed:", loginErr);
+          return next(loginErr);
+        }
+
+        // Your app’s flat session copy
+        req.session.user = user;
+        req.session.authenticated = true;
+
+        req.session.save((saveErr) => {
+          if (saveErr) {
+            console.error("❌ session.save error:", saveErr);
+            return next(saveErr);
+          }
+
+          samlDbg("LOGIN COMPLETE", {
+            redirectingTo: FRONTEND_SUCCESS_REDIRECT,
+            sessionUserEmail:
+              req.session?.user?.email ||
+              req.session?.passport?.user?.email ||
+              null,
+            hasPassport: Boolean(req.session?.passport),
+          });
+
+          return res.redirect(FRONTEND_SUCCESS_REDIRECT);
+        });
+      });
+    };
+
+    // Regenerate if available (helps avoid stale sessions)
+    if (req.session?.regenerate) {
+      req.session.regenerate((regenErr) => {
+        if (regenErr) {
+          console.error("❌ session.regenerate error:", regenErr);
+          return finishLogin();
+        }
+        return finishLogin();
+      });
+    } else {
+      return finishLogin();
+    }
+  })(req, res, next);
+}
+
+/**
+ * ======================================================
  * Start SAML Login
  * GET /api/auth/saml/login
+ * ======================================================
  */
 router.get("/saml/login", (req, res, next) => {
   samlDbg("START LOGIN", {
@@ -28,96 +142,37 @@ router.get("/saml/login", (req, res, next) => {
 });
 
 /**
- * SAML Callback
+ * ======================================================
+ * SAML Callback (Correct ACS)
  * POST /api/auth/saml/callback
- *
- * ✅ This version:
- * - Logs WHY SAML is failing (err/info)
- * - Calls req.login(user) so passport stores session properly
- * - Stores a flat user at req.session.user (your middleware expects this)
+ * ======================================================
  */
-router.post("/saml/callback", (req, res, next) => {
-  passport.authenticate("saml", (err, user, info) => {
-    if (err || !user) {
-      console.error("❌ SAML CALLBACK FAILED", {
-        err: err?.message || err,
-        info,
-      });
+router.post("/saml/callback", handleSamlCallback);
 
-      // Helpful extra debugging
-      samlDbg("CALLBACK REQUEST META", {
-        method: req.method,
-        url: req.originalUrl,
-        origin: req.get("origin"),
-        host: req.get("host"),
-        hasSession: Boolean(req.session),
-        hasBody: Boolean(req.body),
-        bodyKeys: req.body ? Object.keys(req.body) : [],
-      });
+/**
+ * ======================================================
+ * SAFETY ALIAS (Fixes your current 404)
+ * Okta is currently POSTing to /api/auth/saml/login
+ * so handle it like callback.
+ * POST /api/auth/saml/login
+ * ======================================================
+ */
+router.post("/saml/login", (req, res, next) => {
+  samlDbg("POSTED TO /saml/login (alias to callback)", {
+    url: req.originalUrl,
+    host: req.get("host"),
+    origin: req.get("origin"),
+    bodyKeys: req.body ? Object.keys(req.body) : [],
+  });
 
-      return res.redirect(`${FRONTEND_URL}/login`);
-    }
-
-    // ✅ At this point SAML succeeded and we have a user profile
-    samlDbg("SAML USER (from strategy verify)", {
-      email: user.email,
-      name: user.name,
-      groupsType: Array.isArray(user.groups) ? "array" : typeof user.groups,
-      groupsCount: Array.isArray(user.groups) ? user.groups.length : undefined,
-    });
-
-    // (Optional) regenerate session to prevent stale session issues
-    const finishLogin = () => {
-      // ✅ Ensure passport session is established
-      req.login(user, (loginErr) => {
-        if (loginErr) {
-          console.error("❌ req.login failed:", loginErr);
-          return next(loginErr);
-        }
-
-        // ✅ Keep YOUR app’s flat session copy
-        req.session.user = user;
-        req.session.authenticated = true;
-
-        // ✅ Make sure cookie gets written
-        req.session.save((saveErr) => {
-          if (saveErr) {
-            console.error("❌ session.save error:", saveErr);
-            return next(saveErr);
-          }
-
-          samlDbg("LOGIN COMPLETE", {
-            sessionUserEmail:
-              req.session?.user?.email ||
-              req.session?.passport?.user?.email ||
-              null,
-            hasPassport: Boolean(req.session?.passport),
-          });
-
-          return res.redirect(`${FRONTEND_URL}/`);
-        });
-      });
-    };
-
-    // Regenerate only if session exists
-    if (req.session?.regenerate) {
-      req.session.regenerate((regenErr) => {
-        if (regenErr) {
-          console.error("❌ session.regenerate error:", regenErr);
-          // continue without blocking
-          return finishLogin();
-        }
-        return finishLogin();
-      });
-    } else {
-      return finishLogin();
-    }
-  })(req, res, next);
+  return handleSamlCallback(req, res, next);
 });
 
 /**
+ * ======================================================
  * Logout
  * GET /api/auth/logout
+ * ======================================================
  */
 router.get("/logout", (req, res) => {
   try {
@@ -126,7 +181,7 @@ router.get("/logout", (req, res) => {
 
   req.session?.destroy(() => {
     res.clearCookie("eandi.sid");
-    res.redirect(`${FRONTEND_URL}/login`);
+    res.redirect(FRONTEND_LOGIN_REDIRECT);
   });
 });
 
