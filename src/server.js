@@ -9,8 +9,14 @@ import morgan from "morgan";
 import session from "express-session";
 import passport from "passport";
 
-/* Register SAML strategy */
+/**
+ * Register SAML strategy
+ * - If saml.js is self-initializing, import is enough ✅
+ * - If saml.js exports initPassport(), you MUST call it (see commented block below)
+ */
 import "./services/saml.js";
+// If you ever switch to initPassport style, use this instead:
+// import { initPassport } from "./services/saml.js";
 
 /* Routes */
 import health from "./routes/health.js";
@@ -31,29 +37,76 @@ app.set("trust proxy", 1);
 const isProd =
   String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
-/* ENV CHECK (avoid secrets) */
+/* ------------------------------------------------------
+   Startup banner + ENV CHECK (avoid secrets)
+------------------------------------------------------ */
+console.log("🚀 Server starting...", {
+  node: process.version,
+  env: process.env.NODE_ENV,
+  isProd,
+});
+
 console.log("ENV CHECK:", {
   NODE_ENV: process.env.NODE_ENV,
   PORT: process.env.PORT,
   SAML_CALLBACK_URL: process.env.SAML_CALLBACK_URL,
   SAML_ISSUER: process.env.SAML_ISSUER,
   OKTA_SIGNON_URL: process.env.OKTA_SIGNON_URL,
+  OKTA_METADATA_URL: process.env.OKTA_METADATA_URL ? "[set]" : "[missing]",
+  OKTA_X509_CERT_B64: process.env.OKTA_X509_CERT_B64 ? "[set]" : "[missing]",
   CORS_ORIGIN: process.env.CORS_ORIGIN,
   FRONTEND_BASE_URL: process.env.FRONTEND_BASE_URL,
 });
 
-/* Security headers */
+/* ------------------------------------------------------
+   Security headers
+------------------------------------------------------ */
 app.use(
   helmet({
     contentSecurityPolicy: false,
   })
 );
 
-/* Body parsing */
+/* ------------------------------------------------------
+   Body parsing
+   IMPORTANT: Okta POSTs form-encoded SAMLResponse.
+   You already have urlencoded enabled ✅
+------------------------------------------------------ */
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-/* ✅ Session BEFORE passport */
+/* ------------------------------------------------------
+   ✅ Extra request logging for SAML endpoints (SAFE)
+------------------------------------------------------ */
+const DEBUG_SAML =
+  String(process.env.DEBUG_SAML || "true").toLowerCase() === "true";
+app.use((req, _res, next) => {
+  if (!DEBUG_SAML) return next();
+
+  // Only log auth/saml traffic to avoid noisy logs
+  if (req.path.startsWith("/api/auth/saml")) {
+    console.log("🧩 [SAML REQ]", {
+      method: req.method,
+      path: req.path,
+      host: req.get("host"),
+      origin: req.get("origin"),
+      contentType: req.get("content-type"),
+      hasCookie: !!req.get("cookie"),
+      bodyKeys: Object.keys(req.body || {}),
+      // Do NOT log SAMLResponse value itself
+      hasSamlResponse: !!req.body?.SAMLResponse,
+      relayState: req.body?.RelayState ? "[present]" : "[missing]",
+      xfProto: req.get("x-forwarded-proto"),
+      xfHost: req.get("x-forwarded-host"),
+      xfFor: req.get("x-forwarded-for"),
+    });
+  }
+  next();
+});
+
+/* ------------------------------------------------------
+   ✅ Session BEFORE passport
+------------------------------------------------------ */
 app.use(
   session({
     name: "eandi.sid",
@@ -75,10 +128,7 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 /* ======================================================
-   ✅ CORS (FIXED for Okta tile + SAML)
-   - Allows your frontend origins from CORS_ORIGIN
-   - Allows *.okta.com / *.oktapreview.com
-   - ✅ Never blocks /api/auth/saml/* (Okta tile hits these with Origin header)
+   ✅ CORS (your original)
 ====================================================== */
 
 const allowedOrigins = new Set(
@@ -88,12 +138,11 @@ const allowedOrigins = new Set(
     .filter(Boolean)
 );
 
-// Optional: also allow FRONTEND_BASE_URL origin (if set)
 if (process.env.FRONTEND_BASE_URL) {
   try {
     allowedOrigins.add(new URL(process.env.FRONTEND_BASE_URL).origin);
   } catch {
-    // ignore bad url
+    // ignore
   }
 }
 
@@ -113,12 +162,10 @@ function isOktaOrigin(origin) {
   }
 }
 
-// Request-aware CORS delegate (lets us bypass SAML endpoints)
 app.use(
   cors((req, cb) => {
     const origin = req.header("Origin");
 
-    // Server-to-server / top-level navigation (no Origin header)
     if (!origin) {
       return cb(null, {
         origin: true,
@@ -128,8 +175,7 @@ app.use(
       });
     }
 
-    // ✅ Never block SAML endpoints (Okta tile can send Origin: https://eandi.okta.com)
-    // Note: req.path does NOT include query string.
+    // ✅ Never block SAML endpoints
     if (req.path.startsWith("/api/auth/saml")) {
       return cb(null, {
         origin: true,
@@ -139,7 +185,6 @@ app.use(
       });
     }
 
-    // browsers sometimes send Origin: "null"
     if (origin === "null") {
       return cb(null, {
         origin: !isProd,
@@ -149,7 +194,6 @@ app.use(
       });
     }
 
-    // Allow explicit allow-list OR Okta domains
     if (allowedOrigins.has(origin) || isOktaOrigin(origin)) {
       return cb(null, {
         origin: true,
@@ -159,12 +203,10 @@ app.use(
       });
     }
 
-    // Block everything else
     return cb(new Error(`Not allowed by CORS: ${origin}`), { origin: false });
   })
 );
 
-// ✅ IMPORTANT: preflight must use SAME cors delegate
 app.options(
   "*",
   cors((req, cb) => {
@@ -195,7 +237,7 @@ app.use("/api", sspReportsRoutes);
 app.use("/api/notify-accounting", notifyAccounting);
 app.use("/api", me);
 
-/* 404 error*/
+/* 404 */
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
 /* Error handler */
@@ -206,4 +248,11 @@ app.use((err, _req, res, _next) => {
 
 /* Start */
 const port = Number(process.env.PORT) || 8080;
+
+// If you switch to initPassport style, do this:
+// (async () => {
+//   await initPassport();
+//   app.listen(port, () => console.log(`✅ API listening on :${port}`));
+// })();
+
 app.listen(port, () => console.log(`✅ API listening on :${port}`));

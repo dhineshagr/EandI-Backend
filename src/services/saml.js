@@ -4,28 +4,18 @@ dotenv.config();
 
 import passport from "passport";
 import { Strategy as SamlStrategy } from "passport-saml";
+import https from "https";
+import { parseStringPromise } from "xml2js";
 
-/* ------------------------------------------------------
-   Required Environment Variables
------------------------------------------------------- */
-const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
-const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
-const OKTA_SIGNON_URL = (process.env.OKTA_SIGNON_URL || "").trim();
+/* ---------------- Logging ---------------- */
+const DEBUG_SAML =
+  String(process.env.DEBUG_SAML || "true").toLowerCase() === "true";
+function dbg(label, obj) {
+  if (!DEBUG_SAML) return;
+  console.log(`🧩 [SAML DEBUG] ${label}`, obj || "");
+}
 
-// ✅ NEW: base64-encoded PEM cert stored in Azure App Settings
-const OKTA_X509_CERT_B64 = (process.env.OKTA_X509_CERT_B64 || "").trim();
-
-/* ------------------------------------------------------
-   Fail fast
------------------------------------------------------- */
-if (!SAML_CALLBACK_URL) throw new Error("❌ Missing env: SAML_CALLBACK_URL");
-if (!SAML_ISSUER) throw new Error("❌ Missing env: SAML_ISSUER");
-if (!OKTA_SIGNON_URL) throw new Error("❌ Missing env: OKTA_SIGNON_URL");
-if (!OKTA_X509_CERT_B64) throw new Error("❌ Missing env: OKTA_X509_CERT_B64");
-
-/* ------------------------------------------------------
-   Helpers
------------------------------------------------------- */
+/* ---------------- Helpers ---------------- */
 function asArray(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
@@ -51,14 +41,16 @@ function pickEmail(profile) {
 }
 
 function pickName(profile) {
-  return (
-    profile.displayName ||
-    profile.name ||
-    profile.cn ||
-    profile.givenName ||
-    profile.nameID ||
-    ""
-  ).toString();
+  const first = (profile.firstName || profile.givenName || "")
+    .toString()
+    .trim();
+  const last = (profile.lastName || profile.sn || "").toString().trim();
+  const display = (profile.displayName || profile.name || profile.cn || "")
+    .toString()
+    .trim();
+  if (display) return display;
+  const full = `${first} ${last}`.trim();
+  return full || profile.nameID || "";
 }
 
 function pickGroups(profile) {
@@ -68,90 +60,151 @@ function pickGroups(profile) {
   return asArray(g);
 }
 
-function decodePemFromB64(b64) {
-  let v = String(b64 || "").trim();
-
-  // remove wrapping quotes if Azure or pipeline added them
-  if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
-  ) {
-    v = v.slice(1, -1).trim();
-  }
-
-  // remove whitespace/newlines in base64 itself
-  v = v.replace(/\s+/g, "");
-
-  const decoded = Buffer.from(v, "base64")
-    .toString("utf8")
-    .replace(/\\n/g, "\n")
-    .trim();
-
-  if (!decoded.includes("-----BEGIN CERTIFICATE-----")) {
-    // Show only safe diagnostics (no secret dump)
-    throw new Error(
-      "❌ OKTA_X509_CERT_B64 decoded value is NOT a PEM certificate. " +
-        "Please re-check the Azure App Setting value (must be base64 of the full PEM text)."
-    );
-  }
-
-  return decoded;
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
 }
 
-/* ------------------------------------------------------
-   Passport session wiring
------------------------------------------------------- */
-passport.serializeUser((user, done) => done(null, user));
-passport.deserializeUser((user, done) => done(null, user));
+async function loadOktaCertFromMetadata(metadataUrl) {
+  dbg("Fetching Okta metadata", { metadataUrl });
 
-/* ------------------------------------------------------
-   Initialize Strategy
------------------------------------------------------- */
-const signingCertPem = decodePemFromB64(OKTA_X509_CERT_B64);
+  const xml = await httpGet(metadataUrl);
 
-console.log("✅ Okta signing cert decoded from OKTA_X509_CERT_B64", {
-  startsWith: signingCertPem.split("\n")[0],
-  length: signingCertPem.length,
-});
+  dbg("Okta metadata fetched", {
+    xmlLen: xml.length,
+    hasEntityDescriptor: xml.includes("EntityDescriptor"),
+    hasX509: xml.includes("X509Certificate"),
+  });
 
-passport.use(
-  new SamlStrategy(
-    {
-      callbackUrl: SAML_CALLBACK_URL,
-      entryPoint: OKTA_SIGNON_URL,
-      issuer: SAML_ISSUER,
+  const parsed = await parseStringPromise(xml, {
+    explicitArray: true,
+    ignoreAttrs: false,
+    trim: true,
+  });
 
-      // ✅ MUST be the correct SIGNING cert in PEM format
-      cert: signingCertPem,
+  const entity = parsed?.EntityDescriptor;
+  const idp = entity?.IDPSSODescriptor?.[0];
+  const keyDescriptors = idp?.KeyDescriptor || [];
 
-      identifierFormat: null,
-      wantAssertionsSigned: true,
-      wantAuthnResponseSigned: true,
+  let certB64 = null;
 
-      // Azure/Okta stability behind proxies
-      validateInResponseTo: false,
-      acceptedClockSkewMs: 5 * 60 * 1000,
-      requestIdExpirationPeriodMs: 5 * 60 * 1000,
-    },
-    (profile, done) => {
-      try {
-        const email = pickEmail(profile);
-        const groups = pickGroups(profile);
+  for (const kd of keyDescriptors) {
+    const use = kd?.$?.use; // signing | encryption | undefined
+    if (use && use !== "signing") continue;
 
-        return done(null, {
-          email,
-          name: pickName(profile),
-          groups,
-          roles: groups,
-          user_type: "internal",
-          nameID: profile.nameID,
-        });
-      } catch (err) {
-        return done(err);
-      }
+    const x509 =
+      kd?.KeyInfo?.[0]?.X509Data?.[0]?.X509Certificate?.[0] ||
+      kd?.KeyInfo?.[0]?.["ds:X509Data"]?.[0]?.["ds:X509Certificate"]?.[0];
+
+    if (x509) {
+      certB64 = String(x509).replace(/\s+/g, "");
+      break;
     }
-  )
-);
+  }
 
-console.log("✅ Okta SAML strategy initialized");
+  if (!certB64)
+    throw new Error("❌ Could not extract X509Certificate from Okta metadata");
+
+  const lines = certB64.match(/.{1,64}/g)?.join("\n") || certB64;
+  const pem = `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+
+  dbg("Extracted signing cert from metadata (safe)", {
+    pemStartsWith: pem.split("\n")[0],
+    pemLen: pem.length,
+  });
+
+  return pem;
+}
+
+/* ---------------- Init Passport ---------------- */
+export async function initPassport() {
+  const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
+  const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
+
+  // ✅ Use ONE name consistently. Prefer OKTA_SIGNON_URL (matches your Azure)
+  const OKTA_SIGNON_URL = (
+    process.env.OKTA_SIGNON_URL ||
+    process.env.OKTA_SSO_URL ||
+    ""
+  ).trim();
+
+  const OKTA_METADATA_URL = (process.env.OKTA_METADATA_URL || "").trim();
+
+  if (!SAML_CALLBACK_URL) throw new Error("❌ Missing env: SAML_CALLBACK_URL");
+  if (!SAML_ISSUER) throw new Error("❌ Missing env: SAML_ISSUER");
+  if (!OKTA_SIGNON_URL)
+    throw new Error("❌ Missing env: OKTA_SIGNON_URL (or OKTA_SSO_URL)");
+  if (!OKTA_METADATA_URL) throw new Error("❌ Missing env: OKTA_METADATA_URL");
+
+  dbg("SAML ENV (safe)", {
+    SAML_CALLBACK_URL,
+    SAML_ISSUER,
+    OKTA_SIGNON_URL,
+    oktaMetadataHost: (() => {
+      try {
+        return new URL(OKTA_METADATA_URL).host;
+      } catch {
+        return "invalid-url";
+      }
+    })(),
+  });
+
+  const oktaPemCert = await loadOktaCertFromMetadata(OKTA_METADATA_URL);
+
+  passport.use(
+    new SamlStrategy(
+      {
+        callbackUrl: SAML_CALLBACK_URL,
+        entryPoint: OKTA_SIGNON_URL,
+        issuer: SAML_ISSUER,
+
+        // ✅ cert can be string or array
+        cert: [oktaPemCert],
+
+        wantAssertionsSigned: true,
+        wantAuthnResponseSigned: true,
+        identifierFormat: null,
+
+        // Proxy/time skew helpers (Azure)
+        validateInResponseTo: false,
+        acceptedClockSkewMs: 5 * 60 * 1000,
+      },
+      (profile, done) => {
+        try {
+          dbg("SAML profile received (safe)", {
+            keys: profile ? Object.keys(profile) : [],
+            nameID: profile?.nameID
+              ? String(profile.nameID).slice(0, 8) + "***"
+              : null,
+            groupsCount: pickGroups(profile).length,
+            hasEmail: !!pickEmail(profile),
+          });
+
+          return done(null, {
+            email: pickEmail(profile),
+            name: pickName(profile),
+            groups: pickGroups(profile),
+            okta_id: profile?.nameID || null,
+            user_type: "internal",
+          });
+        } catch (err) {
+          return done(err);
+        }
+      }
+    )
+  );
+
+  passport.serializeUser((user, done) => done(null, user));
+  passport.deserializeUser((user, done) => done(null, user));
+
+  console.log("✅ Okta SAML strategy initialized (cert loaded from metadata)");
+}
+
 export default passport;
