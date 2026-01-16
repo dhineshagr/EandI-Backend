@@ -165,7 +165,14 @@ app.use(
 );
 
 // ✅ IMPORTANT: preflight must use SAME cors delegate
-app.options("*", cors());
+app.options(
+  "*",
+  cors((req, cb) => {
+    const origin = req.header("Origin");
+    if (!origin) return cb(null, { origin: true, credentials: true });
+    return cb(null, { origin: true, credentials: true });
+  })
+);
 
 /* Logging */
 app.use(morgan("dev"));

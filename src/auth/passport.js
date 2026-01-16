@@ -1,10 +1,14 @@
-// src/auth/passport.js
 import passport from "passport";
 import { Strategy as SamlStrategy } from "passport-saml";
+import https from "https";
+import { parseStringPromise } from "xml2js";
 
-/* ------------------------------------------------------
-   Helpers
------------------------------------------------------- */
+/**
+ * Minimal XML parser (no extra libs besides xml2js)
+ * If you don't have xml2js:
+ *   npm i xml2js
+ */
+
 function asArray(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
@@ -37,7 +41,6 @@ function pickName(profile) {
   const display = (profile.displayName || profile.name || profile.cn || "")
     .toString()
     .trim();
-
   if (display) return display;
   const full = `${first} ${last}`.trim();
   return full || profile.nameID || "";
@@ -50,68 +53,66 @@ function pickGroups(profile) {
   return asArray(g);
 }
 
-/**
- * Normalize Okta cert from env to PEM that passport-saml expects.
- * Supports:
- *  A) PEM directly (-----BEGIN CERTIFICATE-----)
- *  B) Raw base64 from Okta metadata (<X509Certificate>...</X509Certificate>)
- *  C) Base64 *encoded PEM text* (often starts with LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t)
- */
-function normalizeOktaCert(raw) {
-  if (!raw) return raw;
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
+      })
+      .on("error", reject);
+  });
+}
 
-  let v = String(raw).trim();
+async function loadOktaCertFromMetadata(metadataUrl) {
+  const xml = await httpGet(metadataUrl);
+  const parsed = await parseStringPromise(xml);
 
-  // Remove wrapping quotes if pasted accidentally
-  if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
-  ) {
-    v = v.slice(1, -1).trim();
-  }
+  // Try to locate the X509Certificate node in common Okta metadata structure
+  const entity = parsed?.EntityDescriptor;
+  const idp = entity?.IDPSSODescriptor?.[0];
+  const keyDescriptors = idp?.KeyDescriptor || [];
 
-  // A) Already PEM
-  if (v.includes("BEGIN CERTIFICATE")) {
-    return v.replace(/\\n/g, "\n").trim();
-  }
+  // Prefer "signing" usage if present
+  let certB64 = null;
 
-  // Try decode as base64 (handles case C: base64-encoded PEM)
-  // Only attempt if it "looks like" base64
-  const looksBase64 = /^[A-Za-z0-9+/=\s]+$/.test(v) && v.length > 100;
-  if (looksBase64) {
-    try {
-      const decoded = Buffer.from(v.replace(/\s+/g, ""), "base64").toString(
-        "utf8"
-      );
-      if (decoded.includes("BEGIN CERTIFICATE")) {
-        return decoded.replace(/\\n/g, "\n").trim();
-      }
-      // If decode didn't produce PEM, fall through and treat v as raw base64 cert (case B)
-    } catch {
-      // ignore and fall through
+  for (const kd of keyDescriptors) {
+    const use = kd?.$?.use;
+    if (use && use !== "signing") continue;
+
+    const x509 =
+      kd?.KeyInfo?.[0]?.X509Data?.[0]?.X509Certificate?.[0] ||
+      kd?.KeyInfo?.[0]?.["ds:X509Data"]?.[0]?.["ds:X509Certificate"]?.[0];
+
+    if (x509) {
+      certB64 = String(x509).replace(/\s+/g, "");
+      break;
     }
   }
 
-  // B) Raw base64 cert from metadata → wrap as PEM
-  v = v.replace(/\s+/g, "");
-  const lines = v.match(/.{1,64}/g)?.join("\n") || v;
+  if (!certB64)
+    throw new Error("❌ Could not extract X509Certificate from Okta metadata");
 
+  const lines = certB64.match(/.{1,64}/g)?.join("\n") || certB64;
   return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
 }
 
-/* ------------------------------------------------------
-   Init Passport
------------------------------------------------------- */
-export function initPassport() {
+export async function initPassport() {
   const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
-  const OKTA_SSO_URL = (process.env.OKTA_SSO_URL || "").trim(); // Signon URL
+  const OKTA_SSO_URL = (process.env.OKTA_SSO_URL || "").trim();
   const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
-  const OKTA_X509_CERT = (process.env.OKTA_X509_CERT || "").trim();
+
+  // ✅ New env (already in your Azure): OKTA_METADATA_URL
+  const OKTA_METADATA_URL = (process.env.OKTA_METADATA_URL || "").trim();
 
   if (!SAML_CALLBACK_URL) throw new Error("❌ Missing env: SAML_CALLBACK_URL");
   if (!OKTA_SSO_URL) throw new Error("❌ Missing env: OKTA_SSO_URL");
   if (!SAML_ISSUER) throw new Error("❌ Missing env: SAML_ISSUER");
-  if (!OKTA_X509_CERT) throw new Error("❌ Missing env: OKTA_X509_CERT");
+  if (!OKTA_METADATA_URL) throw new Error("❌ Missing env: OKTA_METADATA_URL");
+
+  // ✅ Always pull the right cert from Okta directly
+  const oktaPemCert = await loadOktaCertFromMetadata(OKTA_METADATA_URL);
 
   passport.use(
     new SamlStrategy(
@@ -119,10 +120,7 @@ export function initPassport() {
         callbackUrl: SAML_CALLBACK_URL,
         entryPoint: OKTA_SSO_URL,
         issuer: SAML_ISSUER,
-
-        // ✅ fixed
-        cert: normalizeOktaCert(OKTA_X509_CERT),
-
+        cert: oktaPemCert,
         wantAssertionsSigned: true,
         wantAuthnResponseSigned: true,
         identifierFormat: null,
@@ -144,6 +142,8 @@ export function initPassport() {
 
   passport.serializeUser((user, done) => done(null, user));
   passport.deserializeUser((user, done) => done(null, user));
+
+  console.log("✅ Okta SAML strategy initialized (cert loaded from metadata)");
 }
 
 export default passport;

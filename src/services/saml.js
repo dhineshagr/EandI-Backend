@@ -1,6 +1,6 @@
 // src/services/saml.js
 import dotenv from "dotenv";
-dotenv.config(); // REQUIRED
+dotenv.config();
 
 import passport from "passport";
 import { Strategy as SamlStrategy } from "passport-saml";
@@ -8,18 +8,10 @@ import { Strategy as SamlStrategy } from "passport-saml";
 /* ------------------------------------------------------
    Required Environment Variables
 ------------------------------------------------------ */
-const SAML_CALLBACK_URL = process.env.SAML_CALLBACK_URL;
-const SAML_ISSUER = process.env.SAML_ISSUER;
-const OKTA_SIGNON_URL = process.env.OKTA_SIGNON_URL;
-const OKTA_X509_CERT = process.env.OKTA_X509_CERT;
-
-/* ------------------------------------------------------
-  OKTA Certificate value issue
------------------------------------------------------- */
-/*const oktaCert =
-  process.env.OKTA_X509_CERT_B64
-    ? Buffer.from(process.env.OKTA_X509_CERT_B64, "base64").toString("utf8")
-    : process.env.OKTA_X509_CERT;*/
+const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
+const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
+const OKTA_SIGNON_URL = (process.env.OKTA_SIGNON_URL || "").trim();
+const OKTA_X509_CERT = (process.env.OKTA_X509_CERT || "").trim();
 
 /* ------------------------------------------------------
    Fail fast with clear errors
@@ -31,26 +23,7 @@ if (!OKTA_X509_CERT) throw new Error("❌ Missing env: OKTA_X509_CERT");
 
 /* ------------------------------------------------------
    Helpers
------------------------------------------------------- */ /* ------------------------------------------------------
-   Helpers – normalize Okta cert (BASE64 → PEM)
 ------------------------------------------------------ */
-function normalizeOktaCert(raw) {
-  if (!raw) return raw;
-
-  let v = raw.trim();
-
-  // Case 1: already PEM → just fix newlines
-  if (v.includes("BEGIN CERTIFICATE")) {
-    return v.replace(/\\n/g, "\n").trim();
-  }
-
-  // Case 2: raw base64 from Okta metadata
-  v = v.replace(/\s+/g, "");
-  const lines = v.match(/.{1,64}/g)?.join("\n") || v;
-
-  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
-}
-
 function asArray(v) {
   if (!v) return [];
   if (Array.isArray(v)) return v.filter(Boolean);
@@ -93,6 +66,53 @@ function pickGroups(profile) {
   return asArray(g);
 }
 
+/**
+ * ✅ Normalize Okta cert from env to PEM.
+ * Supports:
+ *  A) PEM (-----BEGIN CERTIFICATE-----)
+ *  B) Raw base64 from Okta metadata (<X509Certificate>...</X509Certificate>)
+ *  C) Base64-encoded PEM text (often starts with LS0tLS1CRUdJTi...)
+ */
+function normalizeOktaCert(raw) {
+  if (!raw) return raw;
+
+  let v = String(raw).trim();
+
+  // remove accidental wrapping quotes
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+
+  // A) Already PEM
+  if (v.includes("BEGIN CERTIFICATE")) {
+    return v.replace(/\\n/g, "\n").trim();
+  }
+
+  // Try decode as base64 (handles C: base64-encoded PEM)
+  const looksBase64 = /^[A-Za-z0-9+/=\s]+$/.test(v) && v.length > 100;
+  if (looksBase64) {
+    try {
+      const decoded = Buffer.from(v.replace(/\s+/g, ""), "base64").toString(
+        "utf8"
+      );
+      if (decoded.includes("BEGIN CERTIFICATE")) {
+        return decoded.replace(/\\n/g, "\n").trim();
+      }
+    } catch {
+      // ignore and fall through
+    }
+  }
+
+  // B) Raw base64 cert → wrap as PEM
+  v = v.replace(/\s+/g, "");
+  const lines = v.match(/.{1,64}/g)?.join("\n") || v;
+
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
+
 /* ------------------------------------------------------
    Passport session wiring
 ------------------------------------------------------ */
@@ -109,7 +129,8 @@ passport.use(
       entryPoint: OKTA_SIGNON_URL,
       issuer: SAML_ISSUER,
 
-      cert: OKTA_X509_CERT.replace(/\\n/g, "\n"),
+      // ✅ THIS is the actual fix
+      cert: normalizeOktaCert(OKTA_X509_CERT),
 
       identifierFormat: null,
       wantAssertionsSigned: true,
@@ -124,10 +145,8 @@ passport.use(
           email,
           name: pickName(profile),
           groups,
-          roles: groups, // keep consistent for your auth checks
+          roles: groups,
           user_type: "internal",
-
-          // helpful to keep for troubleshooting (optional)
           nameID: profile.nameID,
         });
       } catch (err) {
@@ -137,5 +156,5 @@ passport.use(
   )
 );
 
-console.log("✅ Okta SAML strategy initialized");
+console.log("✅ Okta SAML strategy initialized (cert normalized)");
 export default passport;
