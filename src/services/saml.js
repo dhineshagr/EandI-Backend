@@ -19,7 +19,7 @@ function safeErr(e) {
     message: e?.message || String(e),
     name: e?.name,
     code: e?.code,
-    stackTop: (e?.stack || "").split("\n").slice(0, 8).join("\n"),
+    stackTop: (e?.stack || "").split("\n").slice(0, 6).join("\n"),
   };
 }
 
@@ -65,10 +65,18 @@ function pickGroups(profile) {
   return asArray(g);
 }
 
-function decodePemFromB64(b64) {
-  let v = String(b64 || "").trim();
+/**
+ * Build a proper PEM from:
+ * 1) RAW PEM string (BEGIN/END included)
+ * 2) base64(PEM text)
+ * 3) base64(cert-body only)
+ */
+function toPemCertificate(input) {
+  if (!input) throw new Error("❌ Cert value is empty");
 
-  // strip quotes if azure/pipeline wrapped it
+  let v = String(input).trim();
+
+  // strip wrapping quotes sometimes added by pipelines
   if (
     (v.startsWith('"') && v.endsWith('"')) ||
     (v.startsWith("'") && v.endsWith("'"))
@@ -76,21 +84,68 @@ function decodePemFromB64(b64) {
     v = v.slice(1, -1).trim();
   }
 
-  // remove whitespace in base64
-  v = v.replace(/\s+/g, "");
+  // If user pasted raw PEM into Azure setting, accept it
+  if (v.includes("-----BEGIN CERTIFICATE-----")) {
+    v = v.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").trim();
+    return normalizePem(v);
+  }
 
-  const decoded = Buffer.from(v, "base64")
-    .toString("utf8")
-    .replace(/\\n/g, "\n")
-    .replace(/\r\n/g, "\n")
-    .trim();
+  // Otherwise treat as base64 of something
+  // remove whitespace/newlines in base64 value
+  const b64 = v.replace(/\s+/g, "");
 
-  if (!decoded.includes("-----BEGIN CERTIFICATE-----")) {
+  let decoded;
+  try {
+    decoded = Buffer.from(b64, "base64").toString("utf8").trim();
+  } catch (e) {
     throw new Error(
-      "❌ OKTA_X509_CERT_B64 decoded value is NOT PEM. Must be base64(full PEM text)."
+      "❌ OKTA_X509_CERT_B64 is not valid base64. Please re-check Azure App Setting."
     );
   }
-  return decoded;
+
+  // decoded might be PEM text
+  if (decoded.includes("-----BEGIN CERTIFICATE-----")) {
+    decoded = decoded.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").trim();
+    return normalizePem(decoded);
+  }
+
+  // decoded might be cert-body only (no headers)
+  // so build PEM from it
+  const body = decoded.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/=]+$/.test(body)) {
+    throw new Error(
+      "❌ Decoded value is not PEM text and not a base64 certificate body. Azure value is likely wrong/double-encoded."
+    );
+  }
+
+  const lines = body.match(/.{1,64}/g)?.join("\n") || body;
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
+
+function normalizePem(pem) {
+  // normalize newlines + remove extra blank lines
+  const cleaned = pem
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  // Ensure header/footer exist
+  if (
+    !cleaned.includes("-----BEGIN CERTIFICATE-----") ||
+    !cleaned.includes("-----END CERTIFICATE-----")
+  ) {
+    throw new Error("❌ PEM is missing BEGIN/END CERTIFICATE lines");
+  }
+
+  // Ensure body has 64-char wrapping (OpenSSL likes this)
+  const body = cleaned
+    .replace("-----BEGIN CERTIFICATE-----", "")
+    .replace("-----END CERTIFICATE-----", "")
+    .replace(/\s+/g, "")
+    .trim();
+
+  const wrapped = body.match(/.{1,64}/g)?.join("\n") || body;
+  return `-----BEGIN CERTIFICATE-----\n${wrapped}\n-----END CERTIFICATE-----`;
 }
 
 function inspectCertPem(pem) {
@@ -138,13 +193,16 @@ export function initSamlStrategy() {
     SAML_ISSUER,
     OKTA_SIGNON_URL,
     OKTA_X509_CERT_B64: OKTA_X509_CERT_B64 ? "[set]" : "[missing]",
+    rawLooksLikePem: OKTA_X509_CERT_B64.includes("-----BEGIN CERTIFICATE-----"),
+    rawLen: OKTA_X509_CERT_B64.length,
+    rawHasSpaces: /\s/.test(OKTA_X509_CERT_B64),
   });
 
-  // session wiring
   passport.serializeUser((user, done) => done(null, user));
   passport.deserializeUser((user, done) => done(null, user));
 
-  const signingCertPem = decodePemFromB64(OKTA_X509_CERT_B64);
+  // ✅ Accept raw PEM OR base64(PEM) OR base64(body)
+  const signingCertPem = toPemCertificate(OKTA_X509_CERT_B64);
 
   slog("CERT STRING (SAFE)", {
     firstLine: signingCertPem.split("\n")[0],
@@ -185,7 +243,6 @@ export function initSamlStrategy() {
           const groups = pickGroups(profile);
 
           slog("PROFILE RECEIVED (SAFE)", {
-            hasProfile: !!profile,
             nameID: profile?.nameID,
             email,
             groupsCount: groups.length,
