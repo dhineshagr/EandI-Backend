@@ -129,12 +129,16 @@ passport.use(
       entryPoint: OKTA_SIGNON_URL,
       issuer: SAML_ISSUER,
 
-      // ✅ THIS is the actual fix
       cert: normalizeOktaCert(OKTA_X509_CERT),
 
       identifierFormat: null,
       wantAssertionsSigned: true,
       wantAuthnResponseSigned: true,
+
+      // ✅ recommended for Okta + Azure proxy stability
+      validateInResponseTo: false,
+      requestIdExpirationPeriodMs: 5 * 60 * 1000,
+      acceptedClockSkewMs: 5 * 60 * 1000,
     },
     (profile, done) => {
       try {
