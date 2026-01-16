@@ -10,8 +10,11 @@ import { parseStringPromise } from "xml2js";
 
 /**
  * Cert sources supported (in priority order):
- *  1) OKTA_X509_CERT_PEM  (raw PEM, multi-line; best for Azure App Settings UI)
- *  2) OKTA_X509_CERT_B64  (single-line base64 of PEM; best for Azure DevOps Variable Group)
+ *  1) OKTA_X509_CERT_PEM  (raw PEM; can be multi-line or "\n" escaped)
+ *  2) OKTA_X509_CERT_B64  (single-line base64; can be:
+ *        a) base64 of PEM text (preferred)
+ *        b) base64 of the raw cert body
+ *        c) base64 of DER/binary cert
  *  3) OKTA_METADATA_URL   (fetch metadata and extract signing cert)
  *
  * Required:
@@ -70,53 +73,119 @@ async function loadOktaCertFromMetadata(metadataUrl) {
     }
   }
 
-  if (!certB64)
+  if (!certB64) {
     throw new Error("❌ Could not extract X509Certificate from Okta metadata");
+  }
 
-  const lines = certB64.match(/.{1,64}/g)?.join("\n") || certB64;
-  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+  return wrapCertBodyToPem(certB64);
+}
+
+function stripWrappingQuotes(v) {
+  let s = String(v || "").trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
 }
 
 function normalizePem(pem) {
-  let v = String(pem || "").trim();
+  let v = stripWrappingQuotes(pem);
 
-  // remove wrapping quotes if something added them
-  if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
-  ) {
-    v = v.slice(1, -1).trim();
-  }
-
-  // Convert literal \n to newlines
+  // Convert literal \n to newlines (Azure App Settings often store it like this)
   v = v.replace(/\\n/g, "\n").trim();
 
-  // Ensure proper line breaks if someone stored BEGIN/END with no newlines
+  // Remove BOM if any
+  v = v.replace(/^\uFEFF/, "");
+
+  // Ensure BEGIN/END lines are on their own lines
   if (v.includes("-----BEGIN CERTIFICATE-----") && !v.includes("\n")) {
     v = v
       .replace("-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\n")
       .replace("-----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
   }
 
-  return v;
+  return v.trim();
 }
 
-function pemFromB64(b64) {
-  let v = String(b64 || "").trim();
+function wrapCertBodyToPem(certBodyB64) {
+  const body = String(certBodyB64 || "").replace(/\s+/g, "");
+  const lines = body.match(/.{1,64}/g)?.join("\n") || body;
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
+}
 
-  // remove wrapping quotes
+function isProbablyBase64(s) {
+  const v = String(s || "").trim();
+  if (v.length < 100) return false;
+  // allow newlines/spaces (we strip them)
+  const cleaned = v.replace(/\s+/g, "");
+  // basic base64 charset check
+  return /^[A-Za-z0-9+/=]+$/.test(cleaned);
+}
+
+function tryParseAsPem(pem) {
+  const normalized = normalizePem(pem);
   if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
+    normalized.includes("-----BEGIN CERTIFICATE-----") &&
+    normalized.includes("-----END CERTIFICATE-----")
   ) {
-    v = v.slice(1, -1).trim();
+    return normalized;
+  }
+  return null;
+}
+
+function tryDerBase64ToPem(b64) {
+  // If the base64 is DER (binary), we can convert to PEM using crypto.X509Certificate
+  const cleaned = String(b64 || "").replace(/\s+/g, "");
+  const der = Buffer.from(cleaned, "base64");
+  try {
+    const x = new crypto.X509Certificate(der);
+    // Node returns a PEM string here
+    const pem = x.toString();
+    return normalizePem(pem);
+  } catch {
+    return null;
+  }
+}
+
+function pemFromB64Flexible(b64) {
+  const raw = stripWrappingQuotes(b64).replace(/\s+/g, "");
+
+  // 1) Decode as utf8 text (most common: base64(PEM text))
+  let decodedUtf8 = "";
+  try {
+    decodedUtf8 = Buffer.from(raw, "base64").toString("utf8").trim();
+  } catch {
+    decodedUtf8 = "";
   }
 
-  // remove whitespace/newlines in the base64 string itself
-  v = v.replace(/\s+/g, "");
+  // 1a) If decoded text is PEM, done
+  const pemFromDecoded = tryParseAsPem(decodedUtf8);
+  if (pemFromDecoded) return pemFromDecoded;
 
-  const decoded = Buffer.from(v, "base64").toString("utf8");
-  return normalizePem(decoded);
+  // 1b) If decoded text looks like "just cert body" base64, wrap it
+  if (decodedUtf8 && isProbablyBase64(decodedUtf8)) {
+    const wrapped = wrapCertBodyToPem(decodedUtf8);
+    const asPem = tryParseAsPem(wrapped);
+    if (asPem) return asPem;
+  }
+
+  // 2) If original env var is actually "just cert body" base64, wrap it
+  if (isProbablyBase64(raw)) {
+    const wrapped = wrapCertBodyToPem(raw);
+    // validate quickly by trying crypto parse
+    const ok = inspectCertPem(wrapped).ok;
+    if (ok) return normalizePem(wrapped);
+  }
+
+  // 3) If it is DER base64 (binary), convert DER->PEM
+  const derPem = tryDerBase64ToPem(raw);
+  if (derPem) return derPem;
+
+  // 4) Last resort: return decodedUtf8 (may help diagnose)
+  return normalizePem(decodedUtf8 || "");
 }
 
 function inspectCertPem(pem) {
@@ -128,11 +197,11 @@ function inspectCertPem(pem) {
     lastLine: lines[lines.length - 1],
     length: normalized.length,
     lines: lines.length,
+    hasBegin: normalized.includes("BEGIN CERTIFICATE"),
+    hasEnd: normalized.includes("END CERTIFICATE"),
   });
 
-  // Validate parse under current OpenSSL (helps catch bad base64/format)
   try {
-    // Node expects a valid PEM here; if not, it throws
     // eslint-disable-next-line no-new
     new crypto.X509Certificate(normalized);
     slog("CERT PARSE (crypto.X509Certificate)", { ok: true });
@@ -216,25 +285,40 @@ export async function initSamlStrategy() {
   });
 
   let certPem = "";
+  let certSource = "";
 
   if (OKTA_X509_CERT_PEM) {
     certPem = normalizePem(OKTA_X509_CERT_PEM);
-    slog("CERT SOURCE", "OKTA_X509_CERT_PEM");
+    certSource = "OKTA_X509_CERT_PEM";
   } else if (OKTA_X509_CERT_B64) {
-    certPem = pemFromB64(OKTA_X509_CERT_B64);
-    slog("CERT SOURCE", "OKTA_X509_CERT_B64");
+    // ✅ Flexible: supports base64(PEM text) OR base64(cert body) OR DER base64
+    certPem = pemFromB64Flexible(OKTA_X509_CERT_B64);
+    certSource = "OKTA_X509_CERT_B64";
   } else if (OKTA_METADATA_URL) {
     certPem = await loadOktaCertFromMetadata(OKTA_METADATA_URL);
-    slog("CERT SOURCE", "OKTA_METADATA_URL");
+    certSource = "OKTA_METADATA_URL";
   } else {
     throw new Error(
       "❌ Missing cert source. Set ONE of: OKTA_X509_CERT_PEM OR OKTA_X509_CERT_B64 OR OKTA_METADATA_URL"
     );
   }
 
+  slog("CERT SOURCE", certSource);
+
+  // ✅ Final sanity check: must look like PEM
+  const pemLooksValid =
+    certPem.includes("-----BEGIN CERTIFICATE-----") &&
+    certPem.includes("-----END CERTIFICATE-----");
+
+  if (!pemLooksValid) {
+    const preview = (certPem || "").slice(0, 50).replace(/\n/g, "\\n");
+    throw new Error(
+      `❌ OKTA cert is not PEM after normalization. Source=${certSource} preview="${preview}..."`
+    );
+  }
+
   const certCheck = inspectCertPem(certPem);
   if (!certCheck.ok) {
-    // This is the exact Azure error you saw: bad base64 decode
     throw new Error(
       `❌ Cert cannot be parsed under Node/OpenSSL in Azure. ${
         certCheck.error?.message || ""
@@ -253,14 +337,14 @@ export async function initSamlStrategy() {
         entryPoint: OKTA_SIGNON_URL,
         issuer: SAML_ISSUER,
 
-        // ✅ signing cert (NOT encryption cert)
+        // ✅ Signing cert (PEM)
         cert: certCheck.pem,
 
         identifierFormat: null,
         wantAssertionsSigned: true,
         wantAuthnResponseSigned: true,
 
-        // Stability behind proxies
+        // Stability behind proxies / multi-instance
         validateInResponseTo: false,
         acceptedClockSkewMs: 5 * 60 * 1000,
         requestIdExpirationPeriodMs: 5 * 60 * 1000,
@@ -270,7 +354,6 @@ export async function initSamlStrategy() {
           const email = pickEmail(profile);
           const groups = pickGroups(profile);
 
-          // Safe profile diagnostics (no dump)
           slog("PROFILE (SAFE)", {
             hasProfile: !!profile,
             keys: Object.keys(profile || {}).slice(0, 25),
