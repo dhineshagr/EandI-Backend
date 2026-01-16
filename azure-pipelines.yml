@@ -20,11 +20,11 @@ variables:
 - group: eni-ssp-backend-dev
 
 steps:
-# 1) Install Node
+# 1) Install Node (match Azure runtime: Node 22 LTS)
 - task: NodeTool@0
   inputs:
-    versionSpec: '24.x'
-  displayName: 'Install Node.js 24'
+    versionSpec: '22.x'
+  displayName: 'Install Node.js 22 LTS'
 
 # 2) Install deps + optional build
 - script: |
@@ -38,7 +38,7 @@ steps:
     fi
   displayName: 'Install dependencies and build (if applicable)'
 
-# 3) Zip backend
+# 3) Zip backend (exclude node_modules to keep artifact small)
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: '$(workingDirectory)'
@@ -46,6 +46,11 @@ steps:
     archiveType: 'zip'
     archiveFile: '$(Build.ArtifactStagingDirectory)/backend.zip'
     replaceExistingArchive: true
+    verbose: true
+    excludePatterns: |
+      **/node_modules/**
+      **/.git/**
+      **/.github/**
   displayName: 'Archive backend as ZIP'
 
 # 4) Publish artifact (optional)
@@ -56,7 +61,7 @@ steps:
     publishLocation: 'Container'
   displayName: 'Publish backend artifact'
 
-# 5) Apply App Settings using Azure CLI (no JSON parsing errors)
+# 5) Apply App Settings using Azure CLI
 - task: AzureCLI@2
   displayName: 'Apply App Settings (env vars) to Backend Web App'
   inputs:
@@ -98,7 +103,7 @@ steps:
 
       echo "✅ App settings applied."
 
-# 5b) OPTIONAL: Set OKTA_X509_CERT separately (ONLY IF you stored it as ONE LINE with \n)
+# 5b) Optional: Set OKTA_X509_CERT separately (ONLY if you still use it)
 - task: AzureCLI@2
   displayName: 'Set OKTA_X509_CERT (optional)'
   condition: and(succeeded(), ne(variables['OKTA_X509_CERT'], ''))
