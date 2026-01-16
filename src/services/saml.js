@@ -14,11 +14,8 @@ const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
 const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
 const OKTA_SIGNON_URL = (process.env.OKTA_SIGNON_URL || "").trim();
 
-// ✅ NEW: base64 PEM from Azure App Settings (your current fix)
-const OKTA_X509_CERT_B64 = (process.env.OKTA_X509_CERT_B64 || "").trim();
-
-// Optional: keep metadata fallback if you want it (can leave blank in Azure)
-const OKTA_METADATA_URL = (process.env.OKTA_METADATA_URL || "").trim();
+const OKTA_X509_CERT_B64 = (process.env.OKTA_X509_CERT_B64 || "").trim(); // ✅
+const OKTA_METADATA_URL = (process.env.OKTA_METADATA_URL || "").trim(); // optional fallback
 
 /* ------------------------------------------------------
    Fail fast
@@ -27,7 +24,6 @@ if (!SAML_CALLBACK_URL) throw new Error("❌ Missing env: SAML_CALLBACK_URL");
 if (!SAML_ISSUER) throw new Error("❌ Missing env: SAML_ISSUER");
 if (!OKTA_SIGNON_URL) throw new Error("❌ Missing env: OKTA_SIGNON_URL");
 
-// ✅ Prefer B64 cert (this avoids Okta metadata permission dependency)
 if (!OKTA_X509_CERT_B64 && !OKTA_METADATA_URL) {
   throw new Error(
     "❌ Missing env: OKTA_X509_CERT_B64 (recommended) OR OKTA_METADATA_URL (fallback)"
@@ -49,12 +45,10 @@ function httpGet(url) {
   });
 }
 
-// ✅ Decode base64 PEM text → real PEM
 function decodeOktaCertFromB64(b64) {
-  if (!b64) return "";
+  let v = String(b64 || "").trim();
 
-  // Remove wrapping quotes if they somehow got added
-  let v = String(b64).trim();
+  // remove wrapping quotes if they exist
   if (
     (v.startsWith('"') && v.endsWith('"')) ||
     (v.startsWith("'") && v.endsWith("'"))
@@ -68,12 +62,12 @@ function decodeOktaCertFromB64(b64) {
     .trim();
 
   if (!pem.includes("BEGIN CERTIFICATE")) {
-    throw new Error("❌ OKTA_X509_CERT_B64 decoded value is not a PEM cert");
+    throw new Error("❌ OKTA_X509_CERT_B64 decoded value is not valid PEM");
   }
+
   return pem;
 }
 
-// Metadata fallback (works even if Okta rotates cert, if metadata is accessible)
 async function loadOktaSigningCertFromMetadata(metadataUrl) {
   const xml = await httpGet(metadataUrl);
   const parsed = await parseStringPromise(xml);
@@ -156,8 +150,6 @@ passport.deserializeUser((user, done) => done(null, user));
 
 /* ------------------------------------------------------
    Initialize Strategy
-   ✅ Prefer OKTA_X509_CERT_B64 (no Okta admin dependency)
-   ✅ Fallback to OKTA_METADATA_URL if B64 not provided
 ------------------------------------------------------ */
 (async () => {
   try {
@@ -183,15 +175,13 @@ passport.deserializeUser((user, done) => done(null, user));
           callbackUrl: SAML_CALLBACK_URL,
           entryPoint: OKTA_SIGNON_URL,
           issuer: SAML_ISSUER,
-
-          // ✅ THIS is the key fix for Azure App Service
           cert: signingCertPem,
 
           identifierFormat: null,
           wantAssertionsSigned: true,
           wantAuthnResponseSigned: true,
 
-          // proxy/time skew helpers
+          // proxy/time skew helpers (Azure + Okta)
           validateInResponseTo: false,
           acceptedClockSkewMs: 5 * 60 * 1000,
           requestIdExpirationPeriodMs: 5 * 60 * 1000,
