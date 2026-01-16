@@ -9,12 +9,9 @@ import https from "https";
 import { parseStringPromise } from "xml2js";
 
 /**
- * Cert sources supported (in priority order):
- *  1) OKTA_X509_CERT_PEM  (raw PEM; can be multi-line or "\n" escaped)
- *  2) OKTA_X509_CERT_B64  (single-line base64; can be:
- *        a) base64 of PEM text (preferred)
- *        b) base64 of the raw cert body
- *        c) base64 of DER/binary cert
+ * Cert sources supported (priority):
+ *  1) OKTA_X509_CERT_PEM  (raw PEM text)
+ *  2) OKTA_X509_CERT_B64  (base64 of PEM text OR base64 of DER/binary cert OR base64 of cert body)
  *  3) OKTA_METADATA_URL   (fetch metadata and extract signing cert)
  *
  * Required:
@@ -37,6 +34,36 @@ function safeErr(e) {
   };
 }
 
+function stripWrappingQuotes(v) {
+  let s = String(v || "").trim();
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function normalizePem(pem) {
+  let v = stripWrappingQuotes(pem);
+
+  // Convert literal \n to newlines
+  v = v.replace(/\\n/g, "\n").trim();
+
+  // Remove BOM if any
+  v = v.replace(/^\uFEFF/, "");
+
+  // Ensure BEGIN/END are on their own lines
+  if (v.includes("-----BEGIN CERTIFICATE-----") && !v.includes("\n")) {
+    v = v
+      .replace("-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\n")
+      .replace("-----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
+  }
+
+  return v.trim();
+}
+
 function httpGet(url) {
   return new Promise((resolve, reject) => {
     https
@@ -47,6 +74,12 @@ function httpGet(url) {
       })
       .on("error", reject);
   });
+}
+
+function wrapCertBodyToPem(certBodyB64) {
+  const body = String(certBodyB64 || "").replace(/\s+/g, "");
+  const lines = body.match(/.{1,64}/g)?.join("\n") || body;
+  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
 }
 
 async function loadOktaCertFromMetadata(metadataUrl) {
@@ -80,118 +113,10 @@ async function loadOktaCertFromMetadata(metadataUrl) {
   return wrapCertBodyToPem(certB64);
 }
 
-function stripWrappingQuotes(v) {
-  let s = String(v || "").trim();
-  if (
-    (s.startsWith('"') && s.endsWith('"')) ||
-    (s.startsWith("'") && s.endsWith("'"))
-  ) {
-    s = s.slice(1, -1).trim();
-  }
-  return s;
-}
-
-function normalizePem(pem) {
-  let v = stripWrappingQuotes(pem);
-
-  // Convert literal \n to newlines (Azure App Settings often store it like this)
-  v = v.replace(/\\n/g, "\n").trim();
-
-  // Remove BOM if any
-  v = v.replace(/^\uFEFF/, "");
-
-  // Ensure BEGIN/END lines are on their own lines
-  if (v.includes("-----BEGIN CERTIFICATE-----") && !v.includes("\n")) {
-    v = v
-      .replace("-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\n")
-      .replace("-----END CERTIFICATE-----", "\n-----END CERTIFICATE-----");
-  }
-
-  return v.trim();
-}
-
-function wrapCertBodyToPem(certBodyB64) {
-  const body = String(certBodyB64 || "").replace(/\s+/g, "");
-  const lines = body.match(/.{1,64}/g)?.join("\n") || body;
-  return `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----`;
-}
-
-function isProbablyBase64(s) {
-  const v = String(s || "").trim();
-  if (v.length < 100) return false;
-  // allow newlines/spaces (we strip them)
-  const cleaned = v.replace(/\s+/g, "");
-  // basic base64 charset check
-  return /^[A-Za-z0-9+/=]+$/.test(cleaned);
-}
-
-function tryParseAsPem(pem) {
-  const normalized = normalizePem(pem);
-  if (
-    normalized.includes("-----BEGIN CERTIFICATE-----") &&
-    normalized.includes("-----END CERTIFICATE-----")
-  ) {
-    return normalized;
-  }
-  return null;
-}
-
-function tryDerBase64ToPem(b64) {
-  // If the base64 is DER (binary), we can convert to PEM using crypto.X509Certificate
-  const cleaned = String(b64 || "").replace(/\s+/g, "");
-  const der = Buffer.from(cleaned, "base64");
-  try {
-    const x = new crypto.X509Certificate(der);
-    // Node returns a PEM string here
-    const pem = x.toString();
-    return normalizePem(pem);
-  } catch {
-    return null;
-  }
-}
-
-function pemFromB64Flexible(b64) {
-  const raw = stripWrappingQuotes(b64).replace(/\s+/g, "");
-
-  // 1) Decode as utf8 text (most common: base64(PEM text))
-  let decodedUtf8 = "";
-  try {
-    decodedUtf8 = Buffer.from(raw, "base64").toString("utf8").trim();
-  } catch {
-    decodedUtf8 = "";
-  }
-
-  // 1a) If decoded text is PEM, done
-  const pemFromDecoded = tryParseAsPem(decodedUtf8);
-  if (pemFromDecoded) return pemFromDecoded;
-
-  // 1b) If decoded text looks like "just cert body" base64, wrap it
-  if (decodedUtf8 && isProbablyBase64(decodedUtf8)) {
-    const wrapped = wrapCertBodyToPem(decodedUtf8);
-    const asPem = tryParseAsPem(wrapped);
-    if (asPem) return asPem;
-  }
-
-  // 2) If original env var is actually "just cert body" base64, wrap it
-  if (isProbablyBase64(raw)) {
-    const wrapped = wrapCertBodyToPem(raw);
-    // validate quickly by trying crypto parse
-    const ok = inspectCertPem(wrapped).ok;
-    if (ok) return normalizePem(wrapped);
-  }
-
-  // 3) If it is DER base64 (binary), convert DER->PEM
-  const derPem = tryDerBase64ToPem(raw);
-  if (derPem) return derPem;
-
-  // 4) Last resort: return decodedUtf8 (may help diagnose)
-  return normalizePem(decodedUtf8 || "");
-}
-
 function inspectCertPem(pem) {
   const normalized = normalizePem(pem);
-
   const lines = normalized.split("\n").filter(Boolean);
+
   slog("CERT STRING (SAFE)", {
     firstLine: lines[0],
     lastLine: lines[lines.length - 1],
@@ -213,6 +138,56 @@ function inspectCertPem(pem) {
     });
     return { ok: false, pem: normalized, error: e };
   }
+}
+
+function isBase64Like(v) {
+  const s = String(v || "").replace(/\s+/g, "");
+  if (s.length < 100) return false;
+  return /^[A-Za-z0-9+/=]+$/.test(s);
+}
+
+/**
+ * ✅ Converts OKTA_X509_CERT_B64 to PEM.
+ * Supports:
+ *  - base64(PEM text)
+ *  - base64(DER/binary cert)
+ *  - base64(cert body only)  -> wraps into PEM
+ */
+function pemFromOktaB64(b64Value) {
+  const raw = stripWrappingQuotes(b64Value).replace(/\s+/g, "");
+  if (!raw) return "";
+
+  // A) Try: base64 -> utf8 PEM text
+  try {
+    const decodedText = Buffer.from(raw, "base64").toString("utf8").trim();
+    const maybePem = normalizePem(decodedText);
+    if (maybePem.includes("BEGIN CERTIFICATE")) {
+      return maybePem;
+    }
+
+    // If decoded text is just the cert-body base64, wrap it
+    if (isBase64Like(decodedText)) {
+      return normalizePem(wrapCertBodyToPem(decodedText));
+    }
+  } catch {
+    // ignore and try DER path
+  }
+
+  // B) Try: base64 -> DER buffer -> convert to PEM using crypto
+  try {
+    const derBuf = Buffer.from(raw, "base64");
+    const x = new crypto.X509Certificate(derBuf);
+    return normalizePem(x.toString()); // PEM
+  } catch {
+    // ignore and try cert-body wrap
+  }
+
+  // C) Last try: treat raw itself as cert body and wrap
+  if (isBase64Like(raw)) {
+    return normalizePem(wrapCertBodyToPem(raw));
+  }
+
+  return "";
 }
 
 function pickEmail(profile) {
@@ -258,7 +233,7 @@ function pickName(profile) {
 }
 
 /**
- * ✅ EXPORT THIS (so server.js can call it explicitly)
+ * ✅ EXPORT THIS
  */
 export async function initSamlStrategy() {
   const SAML_CALLBACK_URL = (process.env.SAML_CALLBACK_URL || "").trim();
@@ -285,35 +260,33 @@ export async function initSamlStrategy() {
   });
 
   let certPem = "";
-  let certSource = "";
+  let source = "";
 
   if (OKTA_X509_CERT_PEM) {
+    source = "OKTA_X509_CERT_PEM";
     certPem = normalizePem(OKTA_X509_CERT_PEM);
-    certSource = "OKTA_X509_CERT_PEM";
   } else if (OKTA_X509_CERT_B64) {
-    // ✅ Flexible: supports base64(PEM text) OR base64(cert body) OR DER base64
-    certPem = pemFromB64Flexible(OKTA_X509_CERT_B64);
-    certSource = "OKTA_X509_CERT_B64";
+    source = "OKTA_X509_CERT_B64";
+    certPem = pemFromOktaB64(OKTA_X509_CERT_B64);
   } else if (OKTA_METADATA_URL) {
+    source = "OKTA_METADATA_URL";
     certPem = await loadOktaCertFromMetadata(OKTA_METADATA_URL);
-    certSource = "OKTA_METADATA_URL";
   } else {
     throw new Error(
       "❌ Missing cert source. Set ONE of: OKTA_X509_CERT_PEM OR OKTA_X509_CERT_B64 OR OKTA_METADATA_URL"
     );
   }
 
-  slog("CERT SOURCE", certSource);
+  slog("CERT SOURCE", source);
 
-  // ✅ Final sanity check: must look like PEM
-  const pemLooksValid =
-    certPem.includes("-----BEGIN CERTIFICATE-----") &&
-    certPem.includes("-----END CERTIFICATE-----");
-
-  if (!pemLooksValid) {
-    const preview = (certPem || "").slice(0, 50).replace(/\n/g, "\\n");
+  if (
+    !certPem ||
+    !certPem.includes("-----BEGIN CERTIFICATE-----") ||
+    !certPem.includes("-----END CERTIFICATE-----")
+  ) {
+    const preview = (certPem || "").slice(0, 60).replace(/\n/g, "\\n");
     throw new Error(
-      `❌ OKTA cert is not PEM after normalization. Source=${certSource} preview="${preview}..."`
+      `❌ OKTA cert is not valid PEM after processing. source=${source} preview="${preview}..."`
     );
   }
 
@@ -337,14 +310,13 @@ export async function initSamlStrategy() {
         entryPoint: OKTA_SIGNON_URL,
         issuer: SAML_ISSUER,
 
-        // ✅ Signing cert (PEM)
+        // ✅ Signing certificate PEM
         cert: certCheck.pem,
 
         identifierFormat: null,
         wantAssertionsSigned: true,
         wantAuthnResponseSigned: true,
 
-        // Stability behind proxies / multi-instance
         validateInResponseTo: false,
         acceptedClockSkewMs: 5 * 60 * 1000,
         requestIdExpirationPeriodMs: 5 * 60 * 1000,
