@@ -51,21 +51,48 @@ function pickGroups(profile) {
 }
 
 /**
- * Option B:
- * Azure env var contains raw base64 from Okta metadata (<X509Certificate>...</X509Certificate>)
- * Convert it to PEM before giving to passport-saml.
+ * Normalize Okta cert from env to PEM that passport-saml expects.
+ * Supports:
+ *  A) PEM directly (-----BEGIN CERTIFICATE-----)
+ *  B) Raw base64 from Okta metadata (<X509Certificate>...</X509Certificate>)
+ *  C) Base64 *encoded PEM text* (often starts with LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t)
  */
 function normalizeOktaCert(raw) {
   if (!raw) return raw;
 
-  let v = raw.trim();
+  let v = String(raw).trim();
 
-  // Already PEM → just fix newline escapes
+  // Remove wrapping quotes if pasted accidentally
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+
+  // A) Already PEM
   if (v.includes("BEGIN CERTIFICATE")) {
     return v.replace(/\\n/g, "\n").trim();
   }
 
-  // Raw base64 → wrap as PEM
+  // Try decode as base64 (handles case C: base64-encoded PEM)
+  // Only attempt if it "looks like" base64
+  const looksBase64 = /^[A-Za-z0-9+/=\s]+$/.test(v) && v.length > 100;
+  if (looksBase64) {
+    try {
+      const decoded = Buffer.from(v.replace(/\s+/g, ""), "base64").toString(
+        "utf8"
+      );
+      if (decoded.includes("BEGIN CERTIFICATE")) {
+        return decoded.replace(/\\n/g, "\n").trim();
+      }
+      // If decode didn't produce PEM, fall through and treat v as raw base64 cert (case B)
+    } catch {
+      // ignore and fall through
+    }
+  }
+
+  // B) Raw base64 cert from metadata → wrap as PEM
   v = v.replace(/\s+/g, "");
   const lines = v.match(/.{1,64}/g)?.join("\n") || v;
 
@@ -81,7 +108,6 @@ export function initPassport() {
   const SAML_ISSUER = (process.env.SAML_ISSUER || "").trim();
   const OKTA_X509_CERT = (process.env.OKTA_X509_CERT || "").trim();
 
-  // Fail fast with clear errors
   if (!SAML_CALLBACK_URL) throw new Error("❌ Missing env: SAML_CALLBACK_URL");
   if (!OKTA_SSO_URL) throw new Error("❌ Missing env: OKTA_SSO_URL");
   if (!SAML_ISSUER) throw new Error("❌ Missing env: SAML_ISSUER");
@@ -94,7 +120,7 @@ export function initPassport() {
         entryPoint: OKTA_SSO_URL,
         issuer: SAML_ISSUER,
 
-        // ✅ Option B fix here
+        // ✅ fixed
         cert: normalizeOktaCert(OKTA_X509_CERT),
 
         wantAssertionsSigned: true,
