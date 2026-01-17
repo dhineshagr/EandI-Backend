@@ -265,15 +265,15 @@ export async function initSamlStrategy() {
   if (OKTA_X509_CERT_PEM) {
     source = "OKTA_X509_CERT_PEM";
     certPem = normalizePem(OKTA_X509_CERT_PEM);
-  } else if (OKTA_X509_CERT_B64) {
-    source = "OKTA_X509_CERT_B64";
-    certPem = pemFromOktaB64(OKTA_X509_CERT_B64);
   } else if (OKTA_METADATA_URL) {
     source = "OKTA_METADATA_URL";
     certPem = await loadOktaCertFromMetadata(OKTA_METADATA_URL);
+  } else if (OKTA_X509_CERT_B64) {
+    source = "OKTA_X509_CERT_B64";
+    certPem = pemFromOktaB64(OKTA_X509_CERT_B64);
   } else {
     throw new Error(
-      "❌ Missing cert source. Set ONE of: OKTA_X509_CERT_PEM OR OKTA_X509_CERT_B64 OR OKTA_METADATA_URL"
+      "❌ Missing cert source. Set ONE of: OKTA_X509_CERT_PEM OR OKTA_METADATA_URL OR OKTA_X509_CERT_B64"
     );
   }
 
