@@ -37,6 +37,8 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       "report_type",
       "file_name",
       "uploaded_by",
+      "uploaded_by_name",
+      "uploaded_by_display",
       "uploaded_at_utc",
       "passed_count",
       "failed_count",
@@ -62,6 +64,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           CAST(h.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
           OR rn.Filename LIKE @p${idx}
           OR rn.Uploaded_By LIKE @p${idx}
+          OR rn.Uploaded_By_Name LIKE @p${idx}
         )
       `);
       values.push(`%${search}%`);
@@ -119,7 +122,11 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           h.Report_Number AS report_number,
           rn.Report_Type AS report_type,
           rn.Filename AS file_name,
+
           rn.Uploaded_By AS uploaded_by,
+          rn.Uploaded_By_Name AS uploaded_by_name,
+          COALESCE(NULLIF(rn.Uploaded_By_Name, ''), NULLIF(rn.Uploaded_By, ''), 'System') AS uploaded_by_display,
+
           rn.Uploaded_At_Utc AS uploaded_at_utc,
           h.Report_Status AS report_status,
 
@@ -139,6 +146,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           rn.Report_Type,
           rn.Filename,
           rn.Uploaded_By,
+          rn.Uploaded_By_Name,
           rn.Uploaded_At_Utc,
           h.Report_Status
       )
