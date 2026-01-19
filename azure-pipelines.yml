@@ -17,17 +17,14 @@ variables:
 - name: workingDirectory
   value: '.'
 
-# Variable Group (Library) – keep OKTA_X509_CERT_B64 as secret here
 - group: eni-ssp-backend-dev
 
 steps:
-# 1) Install Node (match Azure runtime: Node 22)
 - task: NodeTool@0
   inputs:
     versionSpec: '22.x'
   displayName: 'Install Node.js 22'
 
-# 2) Install deps + optional build
 - script: |
     set -e
     cd $(workingDirectory)
@@ -39,7 +36,6 @@ steps:
     fi
   displayName: 'Install dependencies and build (if applicable)'
 
-# 3) Zip backend (exclude node_modules to keep artifact small)
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: '$(workingDirectory)'
@@ -54,7 +50,6 @@ steps:
       **/.github/**
   displayName: 'Archive backend as ZIP'
 
-# 4) Publish artifact (optional)
 - task: PublishBuildArtifacts@1
   inputs:
     PathtoPublish: '$(Build.ArtifactStagingDirectory)/backend.zip'
@@ -62,7 +57,6 @@ steps:
     publishLocation: 'Container'
   displayName: 'Publish backend artifact'
 
-# 5) Apply App Settings (env vars) to Backend Web App
 - task: AzureCLI@2
   displayName: 'Apply App Settings (env vars) to Backend Web App'
   inputs:
@@ -70,52 +64,80 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-      set -euo pipefail
+      set -e
 
       az webapp config appsettings set \
         --resource-group "$(resourceGroupName)" \
         --name "$(webAppName)" \
         --settings \
-          NODE_ENV="$(NODE_ENV)" \
-          PORT="$(PORT)" \
-          JWT_SECRET="$(JWT_SECRET)" \
-          JWT_EXPIRES_IN="$(JWT_EXPIRES_IN)" \
-          SAML_ISSUER="$(SAML_ISSUER)" \
-          SAML_CALLBACK_URL="$(SAML_CALLBACK_URL)" \
-          OKTA_SIGNON_URL="$(OKTA_SIGNON_URL)" \
-          OKTA_SSO_URL="$(OKTA_SSO_URL)" \
-          OKTA_METADATA_URL="$(OKTA_METADATA_URL)" \
-          OKTA_X509_CERT_B64="$(OKTA_X509_CERT_B64)" \
-          FRONTEND_SUCCESS_REDIRECT="$(FRONTEND_SUCCESS_REDIRECT)" \
-          CORS_ORIGIN="$(CORS_ORIGIN)" \
-          FRONTEND_BASE_URL="$(FRONTEND_BASE_URL)" \
-          SESSION_SECRET="$(SESSION_SECRET)" \
-          DATABASE_URL="$(DATABASE_URL)" \
-          DB_SERVER="$(DB_SERVER)" \
-          DB_USER="$(DB_USER)" \
-          DB_PASSWORD="$(DB_PASSWORD)" \
-          DB_NAME="$(DB_NAME)" \
-          DB_PORT="$(DB_PORT)" \
-          AZURE_STORAGE_CONNECTION_STRING="$(AZURE_STORAGE_CONNECTION_STRING)" \
-          AZURE_DOWNLOAD_CONTAINERS="$(AZURE_DOWNLOAD_CONTAINERS)" \
-          MAIL_USER="$(MAIL_USER)" \
-          MAIL_PASS="$(MAIL_PASS)" \
-          MAIL_HOST="$(MAIL_HOST)" \
-          MAIL_PORT="$(MAIL_PORT)" \
-          NOTIFY_TO="$(NOTIFY_TO)" \
-          PIPELINE_TRIGGER_URL="$(PIPELINE_TRIGGER_URL)"
+          NODE_ENV="$NODE_ENV" \
+          PORT="$PORT" \
+          JWT_SECRET="$JWT_SECRET" \
+          JWT_EXPIRES_IN="$JWT_EXPIRES_IN" \
+          SAML_ISSUER="$SAML_ISSUER" \
+          SAML_CALLBACK_URL="$SAML_CALLBACK_URL" \
+          OKTA_SIGNON_URL="$OKTA_SIGNON_URL" \
+          OKTA_SSO_URL="$OKTA_SSO_URL" \
+          OKTA_METADATA_URL="$OKTA_METADATA_URL" \
+          OKTA_X509_CERT_B64="$OKTA_X509_CERT_B64" \
+          FRONTEND_SUCCESS_REDIRECT="$FRONTEND_SUCCESS_REDIRECT" \
+          CORS_ORIGIN="$CORS_ORIGIN" \
+          FRONTEND_BASE_URL="$FRONTEND_BASE_URL" \
+          SESSION_SECRET="$SESSION_SECRET" \
+          DATABASE_URL="$DATABASE_URL" \
+          DB_SERVER="$DB_SERVER" \
+          DB_USER="$DB_USER" \
+          DB_PASSWORD="$DB_PASSWORD" \
+          DB_NAME="$DB_NAME" \
+          DB_PORT="$DB_PORT" \
+          AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
+          AZURE_DOWNLOAD_CONTAINERS="$AZURE_DOWNLOAD_CONTAINERS" \
+          MAIL_USER="$MAIL_USER" \
+          MAIL_PASS="$MAIL_PASS" \
+          MAIL_HOST="$MAIL_HOST" \
+          MAIL_PORT="$MAIL_PORT" \
+          NOTIFY_TO="$NOTIFY_TO" \
+          PIPELINE_TRIGGER_URL="$PIPELINE_TRIGGER_URL"
 
       echo "✅ App settings applied."
 
-      # ✅ IMPORTANT: remove old cert envs if they exist, to avoid conflicts
+      # Optional cleanup (prevents old cert env vars from conflicting)
       az webapp config appsettings delete \
         --resource-group "$(resourceGroupName)" \
         --name "$(webAppName)" \
         --setting-names OKTA_X509_CERT OKTA_X509_CERT_PEM || true
 
       echo "✅ Old cert settings removed (if they existed)."
+  env:
+    NODE_ENV: $(NODE_ENV)
+    PORT: $(PORT)
+    JWT_SECRET: $(JWT_SECRET)
+    JWT_EXPIRES_IN: $(JWT_EXPIRES_IN)
+    SAML_ISSUER: $(SAML_ISSUER)
+    SAML_CALLBACK_URL: $(SAML_CALLBACK_URL)
+    OKTA_SIGNON_URL: $(OKTA_SIGNON_URL)
+    OKTA_SSO_URL: $(OKTA_SSO_URL)
+    OKTA_METADATA_URL: $(OKTA_METADATA_URL)
+    OKTA_X509_CERT_B64: $(OKTA_X509_CERT_B64)
+    FRONTEND_SUCCESS_REDIRECT: $(FRONTEND_SUCCESS_REDIRECT)
+    CORS_ORIGIN: $(CORS_ORIGIN)
+    FRONTEND_BASE_URL: $(FRONTEND_BASE_URL)
+    SESSION_SECRET: $(SESSION_SECRET)
+    DATABASE_URL: $(DATABASE_URL)
+    DB_SERVER: $(DB_SERVER)
+    DB_USER: $(DB_USER)
+    DB_PASSWORD: $(DB_PASSWORD)
+    DB_NAME: $(DB_NAME)
+    DB_PORT: $(DB_PORT)
+    AZURE_STORAGE_CONNECTION_STRING: $(AZURE_STORAGE_CONNECTION_STRING)
+    AZURE_DOWNLOAD_CONTAINERS: $(AZURE_DOWNLOAD_CONTAINERS)
+    MAIL_USER: $(MAIL_USER)
+    MAIL_PASS: $(MAIL_PASS)
+    MAIL_HOST: $(MAIL_HOST)
+    MAIL_PORT: $(MAIL_PORT)
+    NOTIFY_TO: $(NOTIFY_TO)
+    PIPELINE_TRIGGER_URL: $(PIPELINE_TRIGGER_URL)
 
-# 6) Deploy ZIP to Azure Web App
 - task: AzureWebApp@1
   displayName: 'Deploy backend.zip to Azure Web App'
   inputs:
