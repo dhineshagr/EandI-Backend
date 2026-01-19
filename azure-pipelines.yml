@@ -17,14 +17,15 @@ variables:
 - name: workingDirectory
   value: '.'
 
+# Variable Group (Library) – keep OKTA_X509_CERT_B64 as secret here
 - group: eni-ssp-backend-dev
 
 steps:
-# 1) Install Node (match Azure runtime: Node 22 LTS)
+# 1) Install Node (match Azure runtime: Node 22)
 - task: NodeTool@0
   inputs:
     versionSpec: '22.x'
-  displayName: 'Install Node.js 22 LTS'
+  displayName: 'Install Node.js 22'
 
 # 2) Install deps + optional build
 - script: |
@@ -61,7 +62,7 @@ steps:
     publishLocation: 'Container'
   displayName: 'Publish backend artifact'
 
-# 5) Apply App Settings using Azure CLI
+# 5) Apply App Settings (env vars) to Backend Web App
 - task: AzureCLI@2
   displayName: 'Apply App Settings (env vars) to Backend Web App'
   inputs:
@@ -69,6 +70,8 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
+      set -euo pipefail
+
       az webapp config appsettings set \
         --resource-group "$(resourceGroupName)" \
         --name "$(webAppName)" \
@@ -82,6 +85,7 @@ steps:
           OKTA_SIGNON_URL="$(OKTA_SIGNON_URL)" \
           OKTA_SSO_URL="$(OKTA_SSO_URL)" \
           OKTA_METADATA_URL="$(OKTA_METADATA_URL)" \
+          OKTA_X509_CERT_B64="$(OKTA_X509_CERT_B64)" \
           FRONTEND_SUCCESS_REDIRECT="$(FRONTEND_SUCCESS_REDIRECT)" \
           CORS_ORIGIN="$(CORS_ORIGIN)" \
           FRONTEND_BASE_URL="$(FRONTEND_BASE_URL)" \
@@ -103,19 +107,13 @@ steps:
 
       echo "✅ App settings applied."
 
-# 5b) Optional: Set OKTA_X509_CERT separately (ONLY if you still use it)
-- task: AzureCLI@2
-  displayName: 'Set OKTA_X509_CERT (optional)'
-  condition: and(succeeded(), ne(variables['OKTA_X509_CERT'], ''))
-  inputs:
-    azureSubscription: '$(azureSubscription)'
-    scriptType: bash
-    scriptLocation: inlineScript
-    inlineScript: |
-      az webapp config appsettings set \
+      # ✅ IMPORTANT: remove old cert envs if they exist, to avoid conflicts
+      az webapp config appsettings delete \
         --resource-group "$(resourceGroupName)" \
         --name "$(webAppName)" \
-        --settings OKTA_X509_CERT="$(OKTA_X509_CERT)"
+        --setting-names OKTA_X509_CERT OKTA_X509_CERT_PEM || true
+
+      echo "✅ Old cert settings removed (if they existed)."
 
 # 6) Deploy ZIP to Azure Web App
 - task: AzureWebApp@1
