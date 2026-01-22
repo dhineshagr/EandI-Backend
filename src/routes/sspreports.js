@@ -9,6 +9,11 @@ const router = express.Router();
    GET /api/ssp/reports
    SSP Dashboard API
 ====================================================================== */
+// ✅ UPDATED: /ssp/reports route
+// - Fixes Status column: computes report_status when header status is NULL/blank
+// - Keeps all existing filters/sort/pagination
+// - Keeps Uploaded By fields (uploaded_by, uploaded_by_name, uploaded_by_display)
+
 router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
   try {
     const {
@@ -46,6 +51,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       "total_purchase",
       "total_caf",
       "report_status",
+      "total_rows", // ✅ optional: allows sorting by total rows
     ];
 
     const sortField = validSortFields.includes(sort) ? sort : "uploaded_at_utc";
@@ -115,6 +121,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     /* --------------------------------------------------
        Main query
+       ✅ Key change: compute report_status if header status is NULL/blank
     -------------------------------------------------- */
     const sql = `
       WITH base AS (
@@ -128,7 +135,33 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           COALESCE(NULLIF(rn.Uploaded_By_Name, ''), NULLIF(rn.Uploaded_By, ''), 'System') AS uploaded_by_display,
 
           rn.Uploaded_At_Utc AS uploaded_at_utc,
-          h.Report_Status AS report_status,
+
+          COUNT(*) AS total_rows,
+
+          -- ✅ FIX: Always return a status for UI grid
+          CASE
+            -- If header has a value, use it
+            WHEN NULLIF(LTRIM(RTRIM(COALESCE(h.Report_Status,''))), '') IS NOT NULL
+              THEN LTRIM(RTRIM(h.Report_Status))
+
+            -- Otherwise compute from detail row dq statuses
+            WHEN SUM(CASE WHEN LOWER(d.DQ_Status) = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'Failed'
+
+            WHEN COUNT(*) > 0
+              AND SUM(CASE WHEN LOWER(d.DQ_Status) = 'approved' THEN 1 ELSE 0 END) = COUNT(*)
+              THEN 'Approved'
+
+            WHEN COUNT(*) > 0
+              AND SUM(CASE WHEN LOWER(d.DQ_Status) = 'passed' THEN 1 ELSE 0 END) = COUNT(*)
+              THEN 'Passed'
+
+            WHEN SUM(CASE WHEN LOWER(d.DQ_Status) = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'Validated'
+
+            WHEN SUM(CASE WHEN LOWER(d.DQ_Status) IN ('new','staged','submitted') THEN 1 ELSE 0 END) > 0
+              THEN 'In Progress'
+
+            ELSE 'Pending'
+          END AS report_status,
 
           SUM(CASE WHEN LOWER(d.DQ_Status) = 'passed' THEN 1 ELSE 0 END) AS passed_count,
           SUM(CASE WHEN LOWER(d.DQ_Status) = 'failed' THEN 1 ELSE 0 END) AS failed_count,
