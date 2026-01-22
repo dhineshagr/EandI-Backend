@@ -4,7 +4,7 @@ import bcrypt from "bcrypt";
 import { query } from "../db.js";
 
 const router = Router();
-console.log(await bcrypt.hash("Password123", 10));
+
 /* ===============================
    SQL LOGIN (BUSINESS PARTNER)
 ================================ */
@@ -45,7 +45,7 @@ router.post("/sql/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    // ✅ Persist SQL session
+    // ✅ Persist SQL session (canonical shape)
     req.session.user = {
       authenticated: true,
       user: {
@@ -60,10 +60,15 @@ router.post("/sql/login", async (req, res) => {
       },
     };
 
-    res.json({ success: true });
+    // ✅ Ensure session is persisted before responding (helps some stores/proxies)
+    await new Promise((resolve, reject) => {
+      req.session.save((err) => (err ? reject(err) : resolve()));
+    });
+
+    return res.json({ success: true });
   } catch (err) {
     console.error("❌ SQL login failed:", err);
-    res.status(500).json({ error: "Login failed" });
+    return res.status(500).json({ error: "Login failed" });
   }
 });
 

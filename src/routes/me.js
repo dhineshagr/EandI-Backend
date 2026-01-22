@@ -12,17 +12,18 @@ function dbg(label, obj) {
 }
 
 // ✅ Support BOTH session shapes:
-// A) NEW/FLAT:   req.session.user = { email, user_type, groups... } AND req.session.authenticated=true
-// B) OLD/NESTED: req.session.user = { authenticated:true, user:{...} }
+// A) FLAT:   req.session.user = { email, user_type, username... }
+// B) NESTED: req.session.user = { authenticated:true, user:{...} }
+// C) passport session: req.session.passport.user
 function getSessionUser(req) {
   const u = req.session?.user;
 
-  // OLD/NESTED
+  // NESTED (canonical after /me normalization)
   if (u && typeof u === "object" && u.user && u.authenticated === true) {
     return u.user;
   }
 
-  // NEW/FLAT (your updated auth.js)
+  // FLAT (older / intermediate)
   if (u && typeof u === "object" && (u.email || u.nameID || u.username)) {
     return u;
   }
@@ -42,21 +43,11 @@ router.get("/me", async (req, res) => {
       topKeys: req.session ? Object.keys(req.session) : [],
       userKeys: req.session?.user ? Object.keys(req.session.user) : [],
       hasPassport: Boolean(req.session?.passport),
-      passportKeys: req.session?.passport
-        ? Object.keys(req.session.passport)
-        : [],
+      passportKeys: req.session?.passport ? Object.keys(req.session.passport) : [],
     });
 
-    // ✅ Auth check supports BOTH styles
-    const isAuthed =
-      req.session?.authenticated === true ||
-      req.session?.user?.authenticated === true ||
-      Boolean(req.session?.passport?.user);
-
-    if (!isAuthed) {
-      return res.status(401).json({ error: "Not authenticated" });
-    }
-
+    // ✅ IMPORTANT FIX:
+    // Only authenticated if we can resolve a real user object from session/passport
     const sessionUser = getSessionUser(req);
 
     dbg("SESSION USER (resolved)", sessionUser);
@@ -76,9 +67,7 @@ router.get("/me", async (req, res) => {
     // INTERNAL USER (OKTA)
     // =========================
     if (isInternal || (!userTypeRaw && sessionUser.email)) {
-      const email = String(sessionUser.email || "")
-        .toLowerCase()
-        .trim();
+      const email = String(sessionUser.email || "").toLowerCase().trim();
       if (!email) {
         return res.status(401).json({ error: "Missing email in session" });
       }
@@ -157,14 +146,14 @@ router.get("/me", async (req, res) => {
       },
     };
 
-    // Store normalized session in the OLD/NESTED shape (for compatibility)
+    // ✅ Always store normalized session in NESTED shape
     req.session.user = normalized;
+
+    // (Optional) keep this flag for legacy compatibility
     req.session.authenticated = true;
 
     // Ensure cookie is persisted
-    req.session.save(() => {
-      return res.json(normalized);
-    });
+    req.session.save(() => res.json(normalized));
   } catch (err) {
     console.error("❌ /api/me error:", err);
     return res.status(500).json({ error: "Failed to load user profile" });

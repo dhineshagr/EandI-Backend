@@ -263,16 +263,20 @@ export async function requireSessionAuth(req, _res, next) {
  * consider passport session store as authenticated as well
  */
 export function requireAuth(req, res, next) {
-  if (req.session?.user || req.session?.passport?.user) {
+  // ✅ Only consider session auth if a real user exists
+  const raw = getRawSessionUser(req);
+  if (raw) {
     return requireSessionAuth(req, res, next);
   }
 
+  // ✅ Otherwise check BP JWT
   if ((req.headers.authorization || "").startsWith("Bearer ")) {
     return requireBpAuth(req, res, next);
   }
 
   return next(createError(401, "Not authenticated"));
 }
+
 
 /* ---------------- Option A Guards ---------------- */
 

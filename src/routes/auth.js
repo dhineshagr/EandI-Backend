@@ -41,10 +41,9 @@ function decodeSamlResponseSafe(b64) {
 function isAllowedReturnUrl(url) {
   try {
     const u = new URL(url);
-    // ✅ Only allow your frontend host (prevents open redirects)
     const allowed = new Set([
       new URL(FRONTEND_URL).origin,
-      // add more allowed frontend origins here if you have them
+      // Add more allowed frontend origins here if needed
     ]);
     return allowed.has(u.origin);
   } catch {
@@ -55,10 +54,8 @@ function isAllowedReturnUrl(url) {
 function finalRedirectUrl(req) {
   const relay = req?.body?.RelayState || req?.query?.RelayState;
 
-  // ✅ If Okta sends RelayState and it is a frontend URL, honor it
   if (relay && isAllowedReturnUrl(relay)) return relay;
 
-  // ✅ Otherwise always go to frontend upload
   return `${FRONTEND_URL}/upload`;
 }
 
@@ -117,7 +114,10 @@ router.post("/saml/login", (req, res, next) => {
         return res.redirect(`${FRONTEND_URL}/login?error=session_failed`);
       }
 
-      req.session.user = user;
+      // ✅ IMPORTANT: store session in a consistent shape
+      // matches SQL login: req.session.user = { authenticated: true, user: {...} }
+      req.session.user = { authenticated: true, user };
+      req.session.save(() => {});
 
       samlDbg("SAML SUCCESS (session stored)", {
         email: user.email,
@@ -170,7 +170,8 @@ router.post("/saml/callback", (req, res, next) => {
         return res.redirect(`${FRONTEND_URL}/login?error=session_failed`);
       }
 
-      req.session.user = user;
+      // ✅ IMPORTANT: store session in a consistent shape
+      req.session.user = { authenticated: true, user };
 
       samlDbg("SAML SUCCESS (session stored)", {
         email: user.email,
@@ -183,5 +184,61 @@ router.post("/saml/callback", (req, res, next) => {
     });
   })(req, res, next);
 });
+
+/**
+ * Logout
+ * POST /api/auth/logout   (depending on how this router is mounted)
+ */
+// Logout
+// POST /api/auth/logout
+router.post("/logout", async (req, res) => {
+  const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+
+  try {
+    // 1) Passport logout (await safely)
+    if (typeof req.logout === "function") {
+      await new Promise((resolve) => {
+        try {
+          req.logout(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    }
+
+    // 2) Clear custom session fields
+    if (req.session) {
+      req.session.user = null;
+      req.session.passport = null;
+    }
+
+    // 3) Destroy the server session
+    await new Promise((resolve) => {
+      if (!req.session) return resolve();
+      req.session.destroy(() => resolve());
+    });
+
+    // 4) Clear cookie (MUST match session config in server.js)
+    res.clearCookie("eandi.sid", {
+      path: "/",
+      httpOnly: true,
+      secure: isProd,
+      sameSite: isProd ? "none" : "lax",
+      maxAge: 0,   
+    });
+
+    // 5) Optional: Okta global logout redirect
+    const oktaLogout = process.env.OKTA_LOGOUT_URL;
+    if (oktaLogout) {
+      return res.json({ success: true, redirect: oktaLogout });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Logout failed:", err);
+    return res.status(500).json({ success: false });
+  }
+});
+
 
 export default router;
