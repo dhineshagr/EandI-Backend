@@ -24,6 +24,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       supplier = "",
       contract = "",
       member = "",
+      // ✅ optional: control what statuses come back
+      // Example: statuses=approved,failed,passed,submitted
+      statuses = "",
       sort = "uploaded_at_utc",
       order = "desc",
       page = 1,
@@ -41,16 +44,14 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       "report_number",
       "report_type",
       "file_name",
-      "uploaded_by",
-      "uploaded_by_name",
       "uploaded_by_display",
       "uploaded_at_utc",
+      "report_status", // ✅ derived status we output
       "passed_count",
       "failed_count",
       "approved_count",
       "total_purchase",
       "total_caf",
-      "report_status",
     ];
 
     const sortField = validSortFields.includes(sort) ? sort : "uploaded_at_utc";
@@ -63,15 +64,14 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     const values = [];
     let idx = 1;
 
+    // Search (Report#, Filename, Uploaded By)
     if (search) {
       conditions.push(`
         (
-          CAST(h.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
+          CAST(rn.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
           OR rn.Filename LIKE @p${idx}
           OR rn.Uploaded_By LIKE @p${idx}
           OR rn.Uploaded_By_Name LIKE @p${idx}
-          OR rn.Status LIKE @p${idx}
-          OR h.Report_Status LIKE @p${idx}
         )
       `);
       values.push(`%${search}%`);
@@ -90,12 +90,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx++;
     }
 
-    if (member) {
-      conditions.push(`d.Member_Number LIKE @p${idx}`);
-      values.push(`%${member}%`);
-      idx++;
-    }
-
+    // Date filter
     if (startDate || endDate) {
       const dateColumn =
         dateType === "Approved_At_Utc"
@@ -117,16 +112,62 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       }
     }
 
+    /* --------------------------------------------------
+       Status filter (optional)
+       Supported: approved, failed, passed, submitted
+       - approved comes from rn.status='approved' OR h.report_status='approved'
+       - passed/failed derived from detail dq_status (or header dq_status if exists)
+       - submitted mapped from rn.status IN ('new','staged')
+    -------------------------------------------------- */
+    const statusList = String(statuses || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+    // We'll filter on the derived status alias later using HAVING-equivalent in outer query
+    // (easier than duplicating CASE in WHERE)
+    const statusFilterSql =
+      statusList.length > 0
+        ? `WHERE base.report_status IN (${statusList
+            .map((_, i) => `@p${idx + i}`)
+            .join(", ")})`
+        : "";
+    if (statusList.length > 0) {
+      values.push(...statusList);
+      idx += statusList.length;
+    }
+
+    /* --------------------------------------------------
+       IMPORTANT:
+       - LEFT JOIN detail so "zero sales" (no detail rows) still appears
+       - If you REALLY need member filter, it requires detail rows. We'll keep it,
+         but it will naturally exclude zero-sales because there is no member row.
+    -------------------------------------------------- */
+    const detailJoin = `LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number`;
+
+    if (member) {
+      // member filter must operate on detail rows -> convert to INNER behavior
+      conditions.push(`d.Member_Number LIKE @p${idx}`);
+      values.push(`%${member}%`);
+      idx++;
+    }
+
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     /* --------------------------------------------------
        Main query
+       report_status is DERIVED to match your 4 statuses:
+       - approved  : rn.status='approved' OR h.report_status='approved'
+       - failed    : any dq_status='failed'
+       - passed    : has detail rows and none failed (or header dq_status='passed')
+       - submitted : rn.status in ('new','staged')
+       Anything else falls back to rn.status
     -------------------------------------------------- */
     const sql = `
       WITH base AS (
         SELECT
-          h.Report_Number AS report_number,
+          rn.Report_Number AS report_number,
           rn.Report_Type AS report_type,
           rn.Filename AS file_name,
 
@@ -136,22 +177,43 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
           rn.Uploaded_At_Utc AS uploaded_at_utc,
 
-          -- ✅ FIX: prefer Report_Number.Status (has all workflow states)
-          COALESCE(NULLIF(rn.Status, ''), NULLIF(h.Report_Status, ''), 'pending') AS report_status,
+          -- counts (0 when no detail rows)
+          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed' THEN 1 ELSE 0 END) AS passed_count,
+          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved' THEN 1 ELSE 0 END) AS approved_count,
 
-          SUM(CASE WHEN LOWER(d.DQ_Status) = 'passed' THEN 1 ELSE 0 END) AS passed_count,
-          SUM(CASE WHEN LOWER(d.DQ_Status) = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-          SUM(CASE WHEN LOWER(d.DQ_Status) = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+          COALESCE(SUM(CAST(d.Purchase_Dollars_Calc AS FLOAT)), 0) AS total_purchase,
+          COALESCE(SUM(CAST(d.CAF_Dollars AS FLOAT)), 0) AS total_caf,
 
-          SUM(CAST(d.Purchase_Dollars_Calc AS FLOAT)) AS total_purchase,
-          SUM(CAST(d.CAF_Dollars AS FLOAT)) AS total_caf
+          -- ✅ DERIVED REPORT STATUS for SSP Dashboard
+          LOWER(
+            CASE
+              WHEN LOWER(COALESCE(NULLIF(h.Report_Status,''),'')) = 'approved' OR LOWER(COALESCE(NULLIF(rn.Status,''),'')) = 'approved'
+                THEN 'approved'
 
-        FROM Cur_Invoice_Header h
-        JOIN Cur_Invoice_Detail d ON d.Report_Number = h.Report_Number
-        JOIN Report_Number rn ON rn.Report_Number = h.Report_Number
+              -- If any failed rows -> failed
+              WHEN SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) > 0
+                THEN 'failed'
+
+              -- If there are detail rows and none failed -> passed
+              WHEN COUNT(d.Report_Number) > 0
+                   AND SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) = 0
+                THEN 'passed'
+
+              -- Submitted = not yet validated/curated
+              WHEN LOWER(COALESCE(NULLIF(rn.Status,''),'')) IN ('new','staged')
+                THEN 'submitted'
+
+              ELSE COALESCE(NULLIF(LOWER(rn.Status),''), 'submitted')
+            END
+          ) AS report_status
+
+        FROM Report_Number rn
+        LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
+        ${detailJoin}
         ${whereClause}
         GROUP BY
-          h.Report_Number,
+          rn.Report_Number,
           rn.Report_Type,
           rn.Filename,
           rn.Uploaded_By,
@@ -162,6 +224,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       )
       SELECT *
       FROM base
+      ${statusFilterSql}
       ORDER BY ${sortField} ${sortOrder}
       OFFSET @p${idx} ROWS FETCH NEXT @p${idx + 1} ROWS ONLY;
     `;
@@ -169,18 +232,38 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     const { rows } = await query(sql, [...values, offset, pageSize]);
 
     /* --------------------------------------------------
-       Count query
+       Count query (same filters + same derived status filtering)
     -------------------------------------------------- */
     const countSql = `
-      SELECT COUNT(*) AS total FROM (
-        SELECT h.Report_Number
-        FROM Cur_Invoice_Header h
-        JOIN Cur_Invoice_Detail d ON d.Report_Number = h.Report_Number
-        JOIN Report_Number rn ON rn.Report_Number = h.Report_Number
+      забот
+      WITH base AS (
+        SELECT
+          rn.Report_Number AS report_number,
+          LOWER(
+            CASE
+              WHEN LOWER(COALESCE(NULLIF(h.Report_Status,''),'')) = 'approved' OR LOWER(COALESCE(NULLIF(rn.Status,''),'')) = 'approved'
+                THEN 'approved'
+              WHEN SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) > 0
+                THEN 'failed'
+              WHEN COUNT(d.Report_Number) > 0
+                   AND SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) = 0
+                THEN 'passed'
+              WHEN LOWER(COALESCE(NULLIF(rn.Status,''),'')) IN ('new','staged')
+                THEN 'submitted'
+              ELSE COALESCE(NULLIF(LOWER(rn.Status),''), 'submitted')
+            END
+          ) AS report_status
+        FROM Report_Number rn
+        LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
+        LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number
         ${whereClause}
-        GROUP BY h.Report_Number
-      ) t;
+        GROUP BY rn.Report_Number, rn.Status, h.Report_Status
+      )
+      SELECT COUNT(*) AS total
+      FROM base
+      ${statusFilterSql};
     `;
+
     const countResult = await query(countSql, values);
 
     res.json({
