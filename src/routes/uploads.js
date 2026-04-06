@@ -94,7 +94,7 @@ async function findBlobByLooseName(
 ============================================================================ */
 router.post("/register", requireAuth, async (req, res) => {
   try {
-    const {
+    let {
       filename,
       report_type = "Sales",
       note = "",
@@ -107,6 +107,23 @@ router.post("/register", requireAuth, async (req, res) => {
 
     if (!filename) {
       return res.status(400).json({ error: "Missing filename" });
+    }
+
+    // ✅ Normalize values (avoid empty string issues)
+    period = period?.trim() || null;
+    bp_code = bp_code?.trim() || null;
+    contract_id = contract_id?.trim() || null;
+    note = note?.trim() || "";
+
+    // ✅ AUTO-FIX: Always use BP code from login for BP users
+    const finalBpCode =
+      user.user_type === "bp" ? user.bp_code || bp_code || null : bp_code;
+
+    // ✅ OPTIONAL VALIDATION (recommended)
+    if (!period) {
+      return res.status(400).json({
+        error: "Period is required",
+      });
     }
 
     const uploadedBy =
@@ -123,6 +140,16 @@ router.post("/register", requireAuth, async (req, res) => {
       "System";
 
     const uploadedByType = user.user_type || "internal";
+
+    // ✅ DEBUG LOG (very useful)
+    console.log("📥 Register Upload Payload:", {
+      filename,
+      report_type,
+      period,
+      bp_code: finalBpCode,
+      contract_id,
+      user_type: user.user_type,
+    });
 
     const sql = `
       INSERT INTO dbo.Report_Number
@@ -166,11 +193,13 @@ router.post("/register", requireAuth, async (req, res) => {
       uploadedByName,
       uploadedByType,
       period,
-      bp_code,
+      finalBpCode, // ✅ FIXED
       contract_id,
     ];
 
     const { rows } = await query(sql, params);
+
+    console.log("✅ Inserted Row:", rows?.[0]);
 
     res.json({ success: true, data: rows?.[0] });
   } catch (err) {
