@@ -17,9 +17,18 @@ const asInt = (v, d = 0) => {
 ====================================================================== */
 router.post("/reports/register", requireAuth, async (req, res, next) => {
   try {
-    const { filename, report_type = "Sales", note = "" } = req.body || {};
-    if (!filename)
+    const {
+      filename,
+      report_type = "Sales",
+      note = "",
+      period = null,
+      bp_code = null,
+      contract_id = null,
+    } = req.body || {};
+
+    if (!filename) {
       return res.status(400).json({ error: "filename is required" });
+    }
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
@@ -34,10 +43,27 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
 
     const sql = `
       INSERT INTO report_number
-        (filename, report_type, uploaded_by, uploaded_by_name, uploaded_by_type,
-         uploaded_at_utc, status, note, created_at_utc, updated_at_utc)
+        (
+          filename,
+          report_type,
+          uploaded_by,
+          uploaded_by_name,
+          uploaded_by_type,
+          period,
+          bp_code,
+          contract_id,
+          uploaded_at_utc,
+          status,
+          note,
+          created_at_utc,
+          updated_at_utc
+        )
       OUTPUT INSERTED.*
-      VALUES (@p1, @p2, @p3, @p4, @p5, GETUTCDATE(), 'new', @p6, GETUTCDATE(), GETUTCDATE());
+      VALUES
+        (
+          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8,
+          GETUTCDATE(), 'new', @p9, GETUTCDATE(), GETUTCDATE()
+        );
     `;
 
     const { rows } = await query(sql, [
@@ -46,6 +72,9 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       uploaded_by,
       uploaded_by_name,
       uploaded_by_type,
+      period,
+      bp_code,
+      contract_id,
       note,
     ]);
 
@@ -54,7 +83,17 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       await query(
         `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
          VALUES (@p1,'register_report',@p2,GETUTCDATE());`,
-        [uploaded_by, JSON.stringify({ filename, report_type, note })]
+        [
+          uploaded_by,
+          JSON.stringify({
+            filename,
+            report_type,
+            note,
+            period,
+            bp_code,
+            contract_id,
+          }),
+        ],
       );
     } catch {}
 
@@ -75,6 +114,9 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.report_number,
         r.filename,
         r.report_type,
+        r.period,
+        r.bp_code,
+        r.contract_id,
 
         -- keep original values (for debugging / exports)
         r.uploaded_by,
@@ -121,6 +163,9 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.report_number,
         r.filename,
         r.report_type,
+        r.period,
+        r.bp_code,
+        r.contract_id,
         r.uploaded_by,
         r.uploaded_by_name,
         r.uploaded_by_type,
@@ -176,7 +221,7 @@ router.get(
       console.error("❌ GET summary error:", err);
       next(err);
     }
-  }
+  },
 );
 
 /* ======================================================================
@@ -224,7 +269,7 @@ router.get(
       console.error("❌ GET rows error:", err);
       next(err);
     }
-  }
+  },
 );
 
 /* ======================================================================
@@ -267,7 +312,7 @@ router.put(
         `SELECT CAST(${field_name} AS NVARCHAR(MAX)) AS old_value
        FROM cur_invoice_detail
        WHERE cur_detail_id=@p1 AND report_number=@p2`,
-        [curDetailId, rn]
+        [curDetailId, rn],
       );
 
       if (!oldRows.length)
@@ -278,7 +323,7 @@ router.put(
        SET ${field_name}=@p1, updated_at_utc=GETUTCDATE()
        OUTPUT INSERTED.*
        WHERE cur_detail_id=@p2 AND report_number=@p3`,
-        [new_value, curDetailId, rn]
+        [new_value, curDetailId, rn],
       );
 
       await query(
@@ -293,7 +338,7 @@ router.put(
           String(new_value ?? ""),
           req.user?.email || "internal",
           reason || "Manual correction",
-        ]
+        ],
       );
 
       res.json({ ok: true, row: updRows[0] });
@@ -301,7 +346,7 @@ router.put(
       console.error("❌ UPDATE row error:", err);
       next(err);
     }
-  }
+  },
 );
 
 /**
@@ -326,7 +371,7 @@ router.put(
          OUTPUT INSERTED.cur_detail_id, INSERTED.dq_status
          WHERE report_number=@p2
            AND dq_status IN ('passed','failed','validated','new','staged');`,
-        [approver, rn]
+        [approver, rn],
       );
 
       for (const row of detailUpd.rows) {
@@ -335,7 +380,7 @@ router.put(
            (report_number, row_key, field_name, old_value, new_value,
             changed_by, change_reason, changed_at_utc)
            VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,'bulk approve',GETUTCDATE());`,
-          [rn, row.cur_detail_id, row.dq_status, approver]
+          [rn, row.cur_detail_id, row.dq_status, approver],
         );
       }
 
@@ -346,7 +391,7 @@ router.put(
              approved_at_utc=GETUTCDATE(),
              updated_at_utc=GETUTCDATE()
          WHERE report_number=@p2;`,
-        [approver, rn]
+        [approver, rn],
       );
 
       await query(
@@ -354,14 +399,14 @@ router.put(
          SET status='approved',
              updated_at_utc=GETUTCDATE()
          WHERE report_number=@p1;`,
-        [rn]
+        [rn],
       );
 
       try {
         await query(
           `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
            VALUES (@p1,'bulk_approve',@p2,GETUTCDATE());`,
-          [approver, JSON.stringify({ report_number: rn })]
+          [approver, JSON.stringify({ report_number: rn })],
         );
       } catch (e) {
         console.warn("users_audit_log skipped:", e.message);
@@ -376,7 +421,7 @@ router.put(
       console.error("❌ PUT /reports/:reportNumber/approve error:", err);
       next(err);
     }
-  }
+  },
 );
 
 /**
@@ -397,7 +442,7 @@ router.put(
         `SELECT dq_status
          FROM cur_invoice_detail
          WHERE report_number=@p1 AND cur_detail_id=@p2;`,
-        [rn, curDetailId]
+        [rn, curDetailId],
       );
       if (!oldRows.length)
         return res.status(404).json({ error: "Row not found" });
@@ -412,7 +457,7 @@ router.put(
              updated_at_utc=GETUTCDATE()
          OUTPUT INSERTED.cur_detail_id, INSERTED.dq_status, INSERTED.approved_by, INSERTED.approved_at_utc
          WHERE report_number=@p1 AND cur_detail_id=@p2;`,
-        [rn, curDetailId, approver]
+        [rn, curDetailId, approver],
       );
 
       await query(
@@ -420,18 +465,18 @@ router.put(
          (report_number, row_key, field_name, old_value, new_value,
           changed_by, change_reason, changed_at_utc)
          VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,'single approve',GETUTCDATE());`,
-        [rn, curDetailId, oldStatus, approver]
+        [rn, curDetailId, oldStatus, approver],
       );
 
       res.json({ ok: true, row: updRows[0] });
     } catch (err) {
       console.error(
         "❌ PUT /reports/:reportNumber/row/:curDetailId/approve error:",
-        err
+        err,
       );
       next(err);
     }
-  }
+  },
 );
 
 /**
@@ -492,8 +537,8 @@ router.get("/:reportNumber/audit-log", requireAuth, async (req, res, next) => {
 
     sql += ` ORDER BY ${sortCol} ${sortOrder}
              OFFSET @p${params.length + 1} ROWS FETCH NEXT @p${
-      params.length + 2
-    } ROWS ONLY;`;
+               params.length + 2
+             } ROWS ONLY;`;
     params.push(offset, limit);
 
     const { rows } = await query(sql, params);
@@ -549,8 +594,8 @@ router.get(
 
       sql += ` ORDER BY ${sortCol} ${sortOrder}
                OFFSET @p${params.length + 1} ROWS FETCH NEXT @p${
-        params.length + 2
-      } ROWS ONLY;`;
+                 params.length + 2
+               } ROWS ONLY;`;
       params.push(offset, limit);
 
       const { rows } = await query(sql, params);
@@ -559,7 +604,7 @@ router.get(
       console.error("❌ GET /reports/:reportNumber/audit-log error:", err);
       res.status(500).json({ error: "Failed to fetch report audit log" });
     }
-  }
+  },
 );
 
 export default router;

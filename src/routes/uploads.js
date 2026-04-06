@@ -46,7 +46,7 @@ function normalizeName(input) {
 function getContentTypeByExt(filename) {
   const ext = (path.extname(filename || "").toLowerCase() || "").replace(
     ".",
-    ""
+    "",
   );
   const map = {
     csv: "text/csv",
@@ -62,7 +62,7 @@ function getContentTypeByExt(filename) {
 async function findBlobByLooseName(
   blobServiceClient,
   containers,
-  requestedName
+  requestedName,
 ) {
   const reqNorm = normalizeName(requestedName);
 
@@ -94,7 +94,15 @@ async function findBlobByLooseName(
 ============================================================================ */
 router.post("/register", requireAuth, async (req, res) => {
   try {
-    const { filename, report_type = "Sales", note = "" } = req.body;
+    const {
+      filename,
+      report_type = "Sales",
+      note = "",
+      period = null,
+      bp_code = null,
+      contract_id = null,
+    } = req.body;
+
     const user = req.user;
 
     if (!filename) {
@@ -126,7 +134,10 @@ router.post("/register", requireAuth, async (req, res) => {
         Status,
         Note,
         Uploaded_By_Name,
-        Uploaded_By_Type
+        Uploaded_By_Type,
+        Period,
+        BP_Code,
+        Contract_ID
       )
       OUTPUT
         INSERTED.Report_Number,
@@ -136,11 +147,14 @@ router.post("/register", requireAuth, async (req, res) => {
         INSERTED.Uploaded_By_Name,
         INSERTED.Uploaded_At_UTC,
         INSERTED.Status,
-        INSERTED.Uploaded_By_Type
+        INSERTED.Uploaded_By_Type,
+        INSERTED.Period,
+        INSERTED.BP_Code,
+        INSERTED.Contract_ID
       VALUES
       (
         @p1, @p2, @p3, GETUTCDATE(),
-        'new', @p4, @p5, @p6
+        'new', @p4, @p5, @p6, @p7, @p8, @p9
       );
     `;
 
@@ -151,9 +165,13 @@ router.post("/register", requireAuth, async (req, res) => {
       note,
       uploadedByName,
       uploadedByType,
+      period,
+      bp_code,
+      contract_id,
     ];
 
     const { rows } = await query(sql, params);
+
     res.json({ success: true, data: rows?.[0] });
   } catch (err) {
     console.error("❌ /uploads/register error:", err);
@@ -274,7 +292,7 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
         WHERE Report_Number = @p1
         ORDER BY Uploaded_At_UTC DESC;
         `,
-        [reportNumber]
+        [reportNumber],
       );
 
       if (!rows?.length) {
@@ -284,7 +302,7 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
       requestedFilename = rows[0].Filename;
       console.log(
         "📥 [DOWNLOAD] report_number -> filename:",
-        requestedFilename
+        requestedFilename,
       );
     }
 
@@ -311,7 +329,7 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
     const found = await findBlobByLooseName(
       blobServiceClient,
       containers,
-      requestedFilename
+      requestedFilename,
     );
 
     if (!found) {

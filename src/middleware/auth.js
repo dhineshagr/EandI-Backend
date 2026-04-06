@@ -193,19 +193,22 @@ export function requireBpAuth(req, _res, next) {
 
 /* ---------------- INTERNAL AUTH (SESSION – OKTA SAML) ---------------- */
 /**
- * ✅ FIX:
- * Passport/session can store user in multiple shapes:
- *   - req.session.user.user  (your current environment)
- *   - req.session.user       (older versions)
- *   - req.session.passport.user (passport default)
+ * ✅ Session user can exist in multiple shapes:
+ *   - req.session.user = { authenticated:true, user:{...} }   ✅ canonical (SQL + updated SAML)
+ *   - req.session.user = { ...user... }                       (older SAML)
+ *   - req.session.passport.user = { ...user... }              (passport default)
  */
 function getRawSessionUser(req) {
-  return (
-    req.session?.user?.user ||
-    req.session?.user ||
-    req.session?.passport?.user ||
-    null
-  );
+  // ✅ Prefer canonical shape first
+  if (req.session?.user?.user) return req.session.user.user;
+
+  // ✅ Passport session (if used)
+  if (req.session?.passport?.user) return req.session.passport.user;
+
+  // ✅ Backward compatibility
+  if (req.session?.user) return req.session.user;
+
+  return null;
 }
 
 export async function requireSessionAuth(req, _res, next) {
@@ -258,10 +261,6 @@ export async function requireSessionAuth(req, _res, next) {
 }
 
 /* ---------------- UNIFIED AUTH ---------------- */
-/**
- * ✅ FIX:
- * consider passport session store as authenticated as well
- */
 export function requireAuth(req, res, next) {
   // ✅ Only consider session auth if a real user exists
   const raw = getRawSessionUser(req);
@@ -276,7 +275,6 @@ export function requireAuth(req, res, next) {
 
   return next(createError(401, "Not authenticated"));
 }
-
 
 /* ---------------- Option A Guards ---------------- */
 
@@ -335,9 +333,7 @@ export async function requireAdminOrAccountingDb(req, _res, next) {
     if (rows[0].is_active === 0 || rows[0].is_active === false)
       return next(createError(403, "User disabled"));
 
-    const role = String(rows[0].role || "")
-      .toLowerCase()
-      .trim();
+    const role = String(rows[0].role || "").toLowerCase().trim();
     const allowed = new Set(["admin", "accounting", "ssp_admins"]);
 
     if (!allowed.has(role)) {
