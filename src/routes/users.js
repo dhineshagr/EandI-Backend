@@ -26,7 +26,7 @@ async function logUserAction(userId, action, oldValues, newValues, changedBy) {
         oldValues ? JSON.stringify(oldValues) : null,
         newValues ? JSON.stringify(newValues) : null,
         changedBy || "system",
-      ]
+      ],
     );
   } catch (err) {
     console.warn("⚠️ users_audit_log skipped:", err.message);
@@ -54,7 +54,7 @@ router.get("/", ...ADMIN_MW, async (req, res) => {
           created_at,
           updated_at
         FROM users
-        ORDER BY user_id ASC;`
+        ORDER BY user_id ASC;`,
     );
 
     res.json({ users: rows });
@@ -88,7 +88,7 @@ router.post("/", ...ADMIN_MW, async (req, res) => {
 
     const dupCheck = await query(
       `SELECT 1 FROM users WHERE LOWER(email)=LOWER(@p1);`,
-      [email]
+      [email],
     );
     if (dupCheck.rows.length) {
       return res.status(400).json({ error: "Email already exists" });
@@ -121,7 +121,7 @@ router.post("/", ...ADMIN_MW, async (req, res) => {
         okta_id || null,
         display_name || null,
         hash,
-      ]
+      ],
     );
 
     const user = rows[0];
@@ -131,7 +131,7 @@ router.post("/", ...ADMIN_MW, async (req, res) => {
       "create",
       null,
       { new: user },
-      req.user?.email
+      req.user?.email,
     );
 
     res.json({ user });
@@ -169,7 +169,7 @@ router.put("/:id", ...ADMIN_MW, async (req, res) => {
     if (email && email !== oldUser.email) {
       const dup = await query(
         `SELECT 1 FROM users WHERE LOWER(email)=LOWER(@p1) AND user_id<>@p2;`,
-        [email, id]
+        [email, id],
       );
       if (dup.rows.length)
         return res.status(400).json({ error: "Email already in use" });
@@ -214,7 +214,7 @@ router.put("/:id", ...ADMIN_MW, async (req, res) => {
          INSERTED.display_name,
          INSERTED.is_active
        WHERE user_id=@p${idx};`,
-      values
+      values,
     );
 
     const updatedUser = rows[0];
@@ -224,7 +224,7 @@ router.put("/:id", ...ADMIN_MW, async (req, res) => {
       "update",
       { old: oldUser },
       { new: updatedUser },
-      req.user?.email
+      req.user?.email,
     );
 
     res.json({ user: updatedUser });
@@ -253,7 +253,7 @@ router.put("/:id/status", ...ADMIN_MW, async (req, res) => {
        SET is_active=@p1, updated_at=GETUTCDATE()
        OUTPUT INSERTED.user_id, INSERTED.username, INSERTED.email, INSERTED.role, INSERTED.is_active
        WHERE user_id=@p2;`,
-      [is_active, id]
+      [is_active, id],
     );
 
     const updatedUser = rows[0];
@@ -263,7 +263,7 @@ router.put("/:id/status", ...ADMIN_MW, async (req, res) => {
       is_active ? "enable" : "disable",
       null,
       { new: updatedUser },
-      req.user?.email
+      req.user?.email,
     );
 
     res.json({ user: updatedUser });
@@ -283,17 +283,31 @@ router.delete("/:id", ...ADMIN_MW, async (req, res) => {
     const { id } = req.params;
 
     const oldRes = await query(
-      `SELECT user_id, username, email, role FROM users WHERE user_id=@p1;`,
-      [id]
+      `SELECT
+          user_id,
+          username,
+          email,
+          display_name,
+          role,
+          user_type,
+          bp_code,
+          okta_id,
+          is_active
+       FROM users
+       WHERE user_id=@p1;`,
+      [id],
     );
-    if (!oldRes.rows.length)
+
+    if (!oldRes.rows.length) {
       return res.status(404).json({ error: "User not found" });
+    }
 
     const oldUser = oldRes.rows[0];
 
-    await query(`DELETE FROM users WHERE user_id=@p1;`, [id]);
-
+    // ✅ Log full snapshot before delete
     await logUserAction(id, "delete", { old: oldUser }, null, req.user?.email);
+
+    await query(`DELETE FROM users WHERE user_id=@p1;`, [id]);
 
     res.json({ ok: true });
   } catch (err) {
@@ -305,6 +319,7 @@ router.delete("/:id", ...ADMIN_MW, async (req, res) => {
 /* ============================================================================
    GET /users/audit/logs — Audit logs (Admin/Accounting only)
 ============================================================================ */
+
 router.get("/audit/logs", ...ADMIN_MW, async (req, res) => {
   try {
     safeParseUrl(req);
@@ -313,16 +328,32 @@ router.get("/audit/logs", ...ADMIN_MW, async (req, res) => {
       `SELECT TOP 50
          l.audit_id,
          l.user_id,
-         u.username,
-         u.email,
+
+         COALESCE(
+           u.username,
+           JSON_VALUE(l.old_values, '$.old.username'),
+           JSON_VALUE(l.new_values, '$.new.username'),
+           JSON_VALUE(l.old_values, '$.username'),
+           JSON_VALUE(l.new_values, '$.username')
+         ) AS username,
+
+         COALESCE(
+           u.email,
+           JSON_VALUE(l.old_values, '$.old.email'),
+           JSON_VALUE(l.new_values, '$.new.email'),
+           JSON_VALUE(l.old_values, '$.email'),
+           JSON_VALUE(l.new_values, '$.email')
+         ) AS email,
+
          l.action,
          l.old_values,
          l.new_values,
          l.changed_by,
          l.created_at_utc
        FROM users_audit_log l
-       LEFT JOIN users u ON l.user_id = u.user_id
-       ORDER BY l.created_at_utc DESC;`
+       LEFT JOIN users u
+         ON l.user_id = u.user_id
+       ORDER BY l.created_at_utc DESC;`,
     );
 
     res.json({ logs: rows });
@@ -331,5 +362,4 @@ router.get("/audit/logs", ...ADMIN_MW, async (req, res) => {
     res.status(500).json({ error: "Failed to fetch audit logs" });
   }
 });
-
 export default router;
