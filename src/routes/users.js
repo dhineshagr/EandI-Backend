@@ -304,9 +304,18 @@ router.delete("/:id", ...ADMIN_MW, async (req, res) => {
 
     const oldUser = oldRes.rows[0];
 
-    // ✅ Log full snapshot before delete
+    // save delete snapshot first
     await logUserAction(id, "delete", { old: oldUser }, null, req.user?.email);
 
+    // detach all old audit rows from live users table
+    await query(
+      `UPDATE users_audit_log
+       SET user_id = NULL
+       WHERE user_id = @p1;`,
+      [id],
+    );
+
+    // now delete the user
     await query(`DELETE FROM users WHERE user_id=@p1;`, [id]);
 
     res.json({ ok: true });
