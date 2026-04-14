@@ -24,6 +24,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       period = null,
       bp_code = null,
       contract_id = null,
+      related_report_number = null,
     } = req.body || {};
 
     if (!filename) {
@@ -32,7 +33,6 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
-    // ✅ prefer display_name if available, else username/email
     const uploaded_by_name =
       req.user?.display_name ||
       req.user?.name ||
@@ -52,6 +52,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
           period,
           bp_code,
           contract_id,
+          related_report_number,
           uploaded_at_utc,
           status,
           note,
@@ -61,8 +62,8 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       OUTPUT INSERTED.*
       VALUES
         (
-          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8,
-          GETUTCDATE(), 'new', @p9, GETUTCDATE(), GETUTCDATE()
+          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
+          GETUTCDATE(), 'new', @p10, GETUTCDATE(), GETUTCDATE()
         );
     `;
 
@@ -75,10 +76,10 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       period,
       bp_code,
       contract_id,
+      related_report_number,
       note,
     ]);
 
-    // best-effort audit
     try {
       await query(
         `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
@@ -92,6 +93,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
             period,
             bp_code,
             contract_id,
+            related_report_number,
           }),
         ],
       );
@@ -117,6 +119,7 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.period,
         r.bp_code,
         r.contract_id,
+        r.related_report_number,
 
         -- keep original values (for debugging / exports)
         r.uploaded_by,
@@ -166,6 +169,7 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.period,
         r.bp_code,
         r.contract_id,
+        r.related_report_number,
         r.uploaded_by,
         r.uploaded_by_name,
         r.uploaded_by_type,
@@ -606,5 +610,179 @@ router.get(
     }
   },
 );
+
+router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
+  try {
+    const {
+      report_type,
+      period = null,
+      bp_code = null,
+      contract_id = null,
+      related_report_number = null,
+      note = "",
+      rows = [],
+    } = req.body || {};
+
+    const allowedTypes = ["Accrual", "Return"];
+    if (!allowedTypes.includes(report_type)) {
+      return res.status(400).json({
+        error: "report_type must be Accrual or Return",
+      });
+    }
+
+    if (!period) {
+      return res.status(400).json({ error: "period is required" });
+    }
+
+    if (!bp_code) {
+      return res.status(400).json({ error: "bp_code is required" });
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ error: "At least one detail row is required" });
+    }
+
+    const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
+
+    const uploaded_by_name =
+      req.user?.display_name ||
+      req.user?.name ||
+      req.user?.username ||
+      (req.user?.email ? req.user.email.split("@")[0] : "Unknown");
+
+    const uploaded_by_type = req.user?.user_type || "internal";
+
+    // 1) Create Report_Number row
+    const reportInsertSql = `
+      INSERT INTO report_number
+        (
+          filename,
+          report_type,
+          uploaded_by,
+          uploaded_by_name,
+          uploaded_by_type,
+          period,
+          bp_code,
+          contract_id,
+          related_report_number,
+          uploaded_at_utc,
+          status,
+          note,
+          created_at_utc,
+          updated_at_utc
+        )
+      OUTPUT INSERTED.*
+      VALUES
+        (
+          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
+          GETUTCDATE(), 'new', @p10, GETUTCDATE(), GETUTCDATE()
+        );
+    `;
+
+    const manualFileName =
+      report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
+
+    const { rows: reportRows } = await query(reportInsertSql, [
+      manualFileName,
+      report_type,
+      uploaded_by,
+      uploaded_by_name,
+      uploaded_by_type,
+      period,
+      bp_code,
+      contract_id,
+      related_report_number || null,
+      note || "",
+    ]);
+
+    const report = reportRows[0];
+    const reportNumber = report.report_number;
+
+    // 2) Create Cur_Invoice_Header row
+    const headerSql = `
+      INSERT INTO cur_invoice_header
+        (
+          report_number,
+          report_status,
+          uploaded_by,
+          uploaded_at_utc,
+          created_at_utc,
+          updated_at_utc
+        )
+      VALUES
+        (
+          @p1, 'new', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE()
+        );
+    `;
+
+    await query(headerSql, [reportNumber, uploaded_by]);
+
+    // 3) Insert detail rows
+    for (const row of rows) {
+      const detailSql = `
+        INSERT INTO cur_invoice_detail
+          (
+            report_number,
+            customer_id,
+            member_number,
+            member_name,
+            purchase_dollars_calc,
+            caf,
+            caf_dollars,
+            dq_status,
+            dq_messages,
+            created_at_utc,
+            updated_at_utc
+          )
+        VALUES
+          (
+            @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
+            GETUTCDATE(), GETUTCDATE()
+          );
+      `;
+
+      await query(detailSql, [
+        reportNumber,
+        row.customer_id || null,
+        row.member_number || null,
+        row.member_name || null,
+        row.purchase_dollars_calc ?? null,
+        row.caf ?? null,
+        row.caf_dollars ?? null,
+        row.dq_status || "passed",
+        row.dq_messages || null,
+      ]);
+    }
+
+    // best-effort audit
+    try {
+      await query(
+        `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
+         VALUES (@p1,'manual_create_report',@p2,GETUTCDATE());`,
+        [
+          uploaded_by,
+          JSON.stringify({
+            report_number: reportNumber,
+            report_type,
+            period,
+            bp_code,
+            contract_id,
+            related_report_number,
+            row_count: rows.length,
+          }),
+        ]
+      );
+    } catch {}
+
+    res.json({
+      ok: true,
+      report,
+      row_count: rows.length,
+    });
+  } catch (err) {
+    console.error("❌ POST /reports/manual-create error:", err);
+    next(err);
+  }
+});
 
 export default router;

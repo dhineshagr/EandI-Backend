@@ -101,6 +101,7 @@ router.post("/register", requireAuth, async (req, res) => {
       period = null,
       bp_code = null,
       contract_id = null,
+      related_report_number = null,
     } = req.body;
 
     const user = req.user;
@@ -114,12 +115,18 @@ router.post("/register", requireAuth, async (req, res) => {
     bp_code = bp_code?.trim() || null;
     contract_id = contract_id?.trim() || null;
     note = note?.trim() || "";
+    related_report_number =
+      related_report_number !== null &&
+      related_report_number !== undefined &&
+      String(related_report_number).trim() !== ""
+        ? Number(related_report_number)
+        : null;
 
     // ✅ AUTO-FIX: Always use BP code from login for BP users
     const finalBpCode =
       user.user_type === "bp" ? user.bp_code || bp_code || null : bp_code;
 
-    // ✅ OPTIONAL VALIDATION (recommended)
+    // ✅ Keep existing period validation
     if (!period) {
       return res.status(400).json({
         error: "Period is required",
@@ -141,13 +148,14 @@ router.post("/register", requireAuth, async (req, res) => {
 
     const uploadedByType = user.user_type || "internal";
 
-    // ✅ DEBUG LOG (very useful)
+    // ✅ DEBUG LOG
     console.log("📥 Register Upload Payload:", {
       filename,
       report_type,
       period,
       bp_code: finalBpCode,
       contract_id,
+      related_report_number,
       user_type: user.user_type,
     });
 
@@ -164,7 +172,8 @@ router.post("/register", requireAuth, async (req, res) => {
         Uploaded_By_Type,
         Period,
         BP_Code,
-        Contract_ID
+        Contract_ID,
+        Related_Report_Number
       )
       OUTPUT
         INSERTED.Report_Number,
@@ -177,11 +186,12 @@ router.post("/register", requireAuth, async (req, res) => {
         INSERTED.Uploaded_By_Type,
         INSERTED.Period,
         INSERTED.BP_Code,
-        INSERTED.Contract_ID
+        INSERTED.Contract_ID,
+        INSERTED.Related_Report_Number
       VALUES
       (
         @p1, @p2, @p3, GETUTCDATE(),
-        'new', @p4, @p5, @p6, @p7, @p8, @p9
+        'new', @p4, @p5, @p6, @p7, @p8, @p9, @p10
       );
     `;
 
@@ -193,8 +203,9 @@ router.post("/register", requireAuth, async (req, res) => {
       uploadedByName,
       uploadedByType,
       period,
-      finalBpCode, // ✅ FIXED
+      finalBpCode,
       contract_id,
+      related_report_number,
     ];
 
     const { rows } = await query(sql, params);
