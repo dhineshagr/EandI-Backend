@@ -639,7 +639,9 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     }
 
     if (!Array.isArray(rows) || rows.length === 0) {
-      return res.status(400).json({ error: "At least one detail row is required" });
+      return res.status(400).json({
+        error: "At least one detail row is required",
+      });
     }
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
@@ -652,7 +654,10 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
     const uploaded_by_type = req.user?.user_type || "internal";
 
-    // 1) Create Report_Number row
+    const manualFileName =
+      report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
+
+    // 1) Create Report_Number
     const reportInsertSql = `
       INSERT INTO report_number
         (
@@ -671,16 +676,20 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
           created_at_utc,
           updated_at_utc
         )
-      OUTPUT INSERTED.*
+      OUTPUT
+        INSERTED.Report_Number AS report_number,
+        INSERTED.Report_Type AS report_type,
+        INSERTED.FileName AS filename,
+        INSERTED.Period AS period,
+        INSERTED.BP_Code AS bp_code,
+        INSERTED.Contract_ID AS contract_id,
+        INSERTED.related_report_number AS related_report_number
       VALUES
         (
           @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
           GETUTCDATE(), 'new', @p10, GETUTCDATE(), GETUTCDATE()
         );
     `;
-
-    const manualFileName =
-      report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
 
     const { rows: reportRows } = await query(reportInsertSql, [
       manualFileName,
@@ -690,15 +699,21 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       uploaded_by_type,
       period,
       bp_code,
-      contract_id,
+      contract_id || null,
       related_report_number || null,
       note || "",
     ]);
 
     const report = reportRows[0];
-    const reportNumber = report.report_number;
+    const reportNumber = report?.report_number ?? report?.Report_Number ?? null;
 
-    // 2) Create Cur_Invoice_Header row
+    if (!reportNumber) {
+      return res.status(500).json({
+        error: "Failed to create report header: missing report number",
+      });
+    }
+
+    // 2) Create Cur_Invoice_Header
     const headerSql = `
       INSERT INTO cur_invoice_header
         (
@@ -717,41 +732,104 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
     await query(headerSql, [reportNumber, uploaded_by]);
 
-    // 3) Insert detail rows
-    for (const row of rows) {
-      const detailSql = `
-        INSERT INTO cur_invoice_detail
-          (
-            report_number,
-            customer_id,
-            member_number,
-            member_name,
-            purchase_dollars_calc,
-            caf,
-            caf_dollars,
-            dq_status,
-            dq_messages,
-            created_at_utc,
-            updated_at_utc
-          )
-        VALUES
-          (
-            @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
-            GETUTCDATE(), GETUTCDATE()
-          );
-      `;
+    // 3) Insert Cur_Invoice_Detail rows (all available fields)
+    const detailSql = `
+      INSERT INTO cur_invoice_detail
+        (
+          report_number,
+          customer_id,
+          member_number,
+          member_name,
+          member_address,
+          member_city,
+          member_state,
+          member_zip,
+          po,
+          invoice,
+          invoice_date,
+          ship_to,
+          ship_to_address,
+          ship_to_city,
+          ship_to_state,
+          ship_to_zip,
+          item,
+          manufacturer,
+          manufacturer_part,
+          um,
+          description,
+          unspsc,
+          category,
+          subcategory,
+          retail_price,
+          contract_price,
+          qty,
+          purchase_dollars_src,
+          purchase_dollars_calc,
+          purchase_dollars_calc_comment,
+          caf,
+          caf_dollars,
+          dq_status,
+          dq_messages,
+          created_at_utc,
+          updated_at_utc
+        )
+      VALUES
+        (
+          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10,
+          @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19, @p20,
+          @p21, @p22, @p23, @p24, @p25, @p26, @p27, @p28, @p29, @p30,
+          @p31, @p32, @p33, @p34, GETUTCDATE(), GETUTCDATE()
+        );
+    `;
 
+    for (const row of rows) {
       await query(detailSql, [
         reportNumber,
         row.customer_id || null,
         row.member_number || null,
         row.member_name || null,
+        row.member_address || null,
+        row.member_city || null,
+        row.member_state || null,
+        row.member_zip || null,
+        row.po || null,
+        row.invoice || null,
+        row.invoice_date || null,
+        row.ship_to || null,
+        row.ship_to_address || null,
+        row.ship_to_city || null,
+        row.ship_to_state || null,
+        row.ship_to_zip || null,
+        row.item || null,
+        row.manufacturer || null,
+        row.manufacturer_part || null,
+        row.um || null,
+        row.description || null,
+        row.unspsc || null,
+        row.category || null,
+        row.subcategory || null,
+        row.retail_price ?? null,
+        row.contract_price ?? null,
+        row.qty ?? null,
+        row.purchase_dollars_src ?? null,
         row.purchase_dollars_calc ?? null,
+        row.purchase_dollars_calc_comment || null,
         row.caf ?? null,
         row.caf_dollars ?? null,
         row.dq_status || "passed",
         row.dq_messages || null,
       ]);
+    }
+
+    // 4) If Return is linked to an Accrual, update original Accrual
+    if (report_type === "Return" && related_report_number) {
+      await query(
+        `UPDATE report_number
+         SET related_report_number = @p1,
+             updated_at_utc = GETUTCDATE()
+         WHERE report_number = @p2;`,
+        [reportNumber, related_report_number],
+      );
     }
 
     // best-effort audit
@@ -770,12 +848,13 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
             related_report_number,
             row_count: rows.length,
           }),
-        ]
+        ],
       );
     } catch {}
 
     res.json({
       ok: true,
+      report_number: reportNumber,
       report,
       row_count: rows.length,
     });
