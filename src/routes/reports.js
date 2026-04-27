@@ -621,6 +621,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       related_report_number = null,
       note = "",
       rows = [],
+      validation_warnings = [],
+      validation_error_details = "",
     } = req.body || {};
 
     const allowedTypes = ["Accrual", "Return"];
@@ -632,9 +634,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     }
 
     if (!period) {
-      return res.status(400).json({
-        error: "period is required",
-      });
+      return res.status(400).json({ error: "period is required" });
     }
 
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -712,7 +712,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       });
     }
 
-    const headerSql = `
+    await query(
+      `
       INSERT INTO dbo.Cur_Invoice_Header
       (
         Report_Number,
@@ -726,9 +727,9 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       (
         @p1, 'submitted', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE()
       );
-    `;
-
-    await query(headerSql, [reportNumber, uploaded_by]);
+      `,
+      [reportNumber, uploaded_by],
+    );
 
     const stageSql = `
       INSERT INTO dbo.Stg_Invoice_Raw
@@ -809,37 +810,23 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       ]);
     }
 
-    if (report_type === "Return" && related_report_number) {
-      await query(
-        `
-        UPDATE dbo.Report_Number
-        SET related_report_number = @p1,
-            Updated_At_UTC = GETUTCDATE()
-        WHERE Report_Number = @p2;
-        `,
-        [reportNumber, related_report_number],
-      );
-    }
-
     let trigger_result = null;
 
     try {
       if (process.env.PIPELINE_TRIGGER_URL) {
-        const triggerPayload = {
-          report_number: reportNumber,
-          report_type,
-          period,
-          bp_code: bp_code || null,
-          contract_id: contract_id || null,
-          related_report_number: related_report_number || null,
-          source: "manual_ui",
-          uploaded_by,
-        };
-
         const triggerRes = await fetch(process.env.PIPELINE_TRIGGER_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(triggerPayload),
+          body: JSON.stringify({
+            report_number: reportNumber,
+            report_type,
+            period,
+            bp_code: bp_code || null,
+            contract_id: contract_id || null,
+            related_report_number: related_report_number || null,
+            source: "manual_ui",
+            uploaded_by,
+          }),
         });
 
         trigger_result = {
@@ -848,11 +835,6 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         };
       }
     } catch (triggerErr) {
-      console.warn(
-        "Manual report pipeline trigger failed:",
-        triggerErr.message,
-      );
-
       trigger_result = {
         ok: false,
         error: triggerErr.message,
@@ -887,7 +869,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
             contract_id: contract_id || null,
             related_report_number: related_report_number || null,
             row_count: rows.length,
-            staged_only: true,
+            validation_warnings,
+            validation_error_details,
             trigger_result,
           }),
         ],
