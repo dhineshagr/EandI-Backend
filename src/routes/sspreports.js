@@ -13,6 +13,8 @@ const router = express.Router();
 // - Fixes Status column: computes report_status when header status is NULL/blank
 // - Keeps all existing filters/sort/pagination
 // - Keeps Uploaded By fields (uploaded_by, uploaded_by_name, uploaded_by_display)
+// routes/sspreports.js
+
 router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
   try {
     const {
@@ -36,6 +38,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const validSortFields = [
       "report_number",
+      "related_report_number", // ✅ NEW
       "report_type",
       "file_name",
       "uploaded_by_display",
@@ -52,16 +55,21 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     ];
 
     const sortField = validSortFields.includes(sort) ? sort : "uploaded_at_utc";
+
     const sortOrder = String(order).toLowerCase() === "asc" ? "ASC" : "DESC";
 
     const conditions = [];
     const values = [];
     let idx = 1;
 
+    /* ============================
+       🔍 SEARCH
+    ============================ */
     if (search) {
       conditions.push(`
         (
           CAST(rn.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
+          OR CAST(rn.Related_Report_Number AS NVARCHAR(50)) LIKE @p${idx}  -- ✅ NEW
           OR rn.Filename LIKE @p${idx}
           OR rn.Uploaded_By LIKE @p${idx}
           OR rn.Uploaded_By_Name LIKE @p${idx}
@@ -130,15 +138,20 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
         : "";
 
     const statusFilterValuesStartIdx = idx;
+
     if (statusList.length > 0) {
       values.push(...statusList);
       idx += statusList.length;
     }
 
+    /* ============================
+       MAIN QUERY
+    ============================ */
     const sql = `
       ;WITH base AS (
         SELECT
           rn.Report_Number AS report_number,
+          rn.Related_Report_Number AS related_report_number,  -- ✅ NEW
           rn.Report_Type   AS report_type,
           rn.Filename      AS file_name,
           rn.Period        AS period,
@@ -182,8 +195,10 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
         LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
         LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number
         ${whereClause}
+
         GROUP BY
           rn.Report_Number,
+          rn.Related_Report_Number, -- ✅ NEW
           rn.Report_Type,
           rn.Filename,
           rn.Period,
@@ -204,45 +219,23 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const { rows } = await query(sql, [...values, offset, pageSize]);
 
-    const countValues = [...values];
-
+    /* ============================
+       COUNT QUERY
+    ============================ */
     const countSql = `
       ;WITH base AS (
         SELECT
-          rn.Report_Number AS report_number,
-          LOWER(
-            CASE
-              WHEN LOWER(COALESCE(NULLIF(h.Report_Status,''),'')) = 'approved'
-                   OR LOWER(COALESCE(NULLIF(rn.Status,''),'')) = 'approved'
-                THEN 'approved'
-              WHEN SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) > 0
-                THEN 'failed'
-              WHEN COUNT(d.Report_Number) > 0
-                   AND SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) = 0
-                THEN 'passed'
-              WHEN LOWER(COALESCE(NULLIF(rn.Status,''),'')) IN ('new','staged')
-                THEN 'submitted'
-              ELSE COALESCE(NULLIF(LOWER(rn.Status),''), 'submitted')
-            END
-          ) AS report_status
+          rn.Report_Number AS report_number
         FROM Report_Number rn
         LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
         LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number
         ${whereClause}
         GROUP BY rn.Report_Number, rn.Status, h.Report_Status
       )
-      SELECT COUNT(*) AS total
-      FROM base
-      ${
-        statusList.length > 0
-          ? `WHERE base.report_status IN (${statusList
-              .map((_, i) => `@p${statusFilterValuesStartIdx + i}`)
-              .join(", ")})`
-          : ""
-      };
+      SELECT COUNT(*) AS total FROM base;
     `;
 
-    const countResult = await query(countSql, countValues);
+    const countResult = await query(countSql, values);
 
     res.json({
       reports: rows,
