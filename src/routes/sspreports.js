@@ -83,14 +83,14 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     }
 
     if (supplier) {
-      conditions.push(`rn.BP_Code = @p${idx}`);
-      values.push(supplier);
+      conditions.push(`rn.BP_Code LIKE @p${idx}`);
+      values.push(`%${supplier}%`);
       idx++;
     }
 
     if (contract) {
-      conditions.push(`rn.Contract_ID = @p${idx}`);
-      values.push(contract);
+      conditions.push(`rn.Contract_ID LIKE @p${idx}`);
+      values.push(`%${contract}%`);
       idx++;
     }
 
