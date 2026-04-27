@@ -653,6 +653,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
     const uploaded_by_type = req.user?.user_type || "internal";
 
+    const finalBpCode =
+      req.user?.user_type === "bp"
+        ? req.user?.bp_code || bp_code || null
+        : bp_code || null;
+
     const manualFileName =
       report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
 
@@ -697,7 +702,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       uploaded_by_name,
       uploaded_by_type,
       period,
-      bp_code || null,
+      finalBpCode,
       contract_id || null,
       related_report_number || null,
       note || "",
@@ -821,7 +826,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
             report_number: reportNumber,
             report_type,
             period,
-            bp_code: bp_code || null,
+            bp_code: finalBpCode,
             contract_id: contract_id || null,
             related_report_number: related_report_number || null,
             source: "manual_ui",
@@ -865,7 +870,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
             report_number: reportNumber,
             report_type,
             period,
-            bp_code: bp_code || null,
+            bp_code: finalBpCode,
             contract_id: contract_id || null,
             related_report_number: related_report_number || null,
             row_count: rows.length,
