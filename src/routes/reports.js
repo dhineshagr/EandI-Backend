@@ -624,6 +624,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     } = req.body || {};
 
     const allowedTypes = ["Accrual", "Return"];
+
     if (!allowedTypes.includes(report_type)) {
       return res.status(400).json({
         error: "report_type must be Accrual or Return",
@@ -631,51 +632,15 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     }
 
     if (!period) {
-      return res.status(400).json({ error: "period is required" });
-    }
-
-    if (!bp_code) {
-      return res.status(400).json({ error: "bp_code is required" });
+      return res.status(400).json({
+        error: "period is required",
+      });
     }
 
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.status(400).json({
         error: "At least one detail row is required",
       });
-    }
-
-    const requiredRowFields = [
-      "customer_id",
-      "member_number",
-      "member_name",
-      "member_address",
-      "member_city",
-      "member_state",
-      "member_zip",
-      "ship_to",
-      "ship_to_address",
-      "ship_to_city",
-      "ship_to_state",
-      "ship_to_zip",
-      "purchase_dollars",
-      "caf",
-      "caf_dollars",
-    ];
-
-    for (let i = 0; i < rows.length; i += 1) {
-      const row = rows[i] || {};
-      for (const field of requiredRowFields) {
-        const value = row[field];
-        if (
-          value === null ||
-          value === undefined ||
-          String(value).trim() === ""
-        ) {
-          return res.status(400).json({
-            error: `Row ${i + 1}: ${field} is required`,
-          });
-        }
-      }
     }
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
@@ -691,25 +656,24 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     const manualFileName =
       report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
 
-    // 1) Create Report_Number (submitted, not passed)
     const reportInsertSql = `
-      INSERT INTO report_number
-        (
-          filename,
-          report_type,
-          uploaded_by,
-          uploaded_by_name,
-          uploaded_by_type,
-          period,
-          bp_code,
-          contract_id,
-          related_report_number,
-          uploaded_at_utc,
-          status,
-          note,
-          created_at_utc,
-          updated_at_utc
-        )
+      INSERT INTO dbo.Report_Number
+      (
+        FileName,
+        Report_Type,
+        Uploaded_By,
+        Uploaded_By_Name,
+        Uploaded_By_Type,
+        Period,
+        BP_Code,
+        Contract_ID,
+        related_report_number,
+        Uploaded_At_UTC,
+        Status,
+        Note,
+        Created_At_UTC,
+        Updated_At_UTC
+      )
       OUTPUT
         INSERTED.Report_Number AS report_number,
         INSERTED.Report_Type AS report_type,
@@ -720,10 +684,10 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         INSERTED.related_report_number AS related_report_number,
         INSERTED.Status AS status
       VALUES
-        (
-          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
-          GETUTCDATE(), 'submitted', @p10, GETUTCDATE(), GETUTCDATE()
-        );
+      (
+        @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
+        GETUTCDATE(), 'submitted', @p10, GETUTCDATE(), GETUTCDATE()
+      );
     `;
 
     const { rows: reportRows } = await query(reportInsertSql, [
@@ -733,13 +697,13 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       uploaded_by_name,
       uploaded_by_type,
       period,
-      bp_code,
+      bp_code || null,
       contract_id || null,
       related_report_number || null,
       note || "",
     ]);
 
-    const report = reportRows[0];
+    const report = reportRows?.[0];
     const reportNumber = report?.report_number ?? report?.Report_Number ?? null;
 
     if (!reportNumber) {
@@ -748,68 +712,66 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       });
     }
 
-    // 2) Create Cur_Invoice_Header (submitted, waiting for Informatica validation)
     const headerSql = `
-      INSERT INTO cur_invoice_header
-        (
-          report_number,
-          report_status,
-          uploaded_by,
-          uploaded_at_utc,
-          created_at_utc,
-          updated_at_utc
-        )
+      INSERT INTO dbo.Cur_Invoice_Header
+      (
+        Report_Number,
+        Report_Status,
+        Uploaded_By,
+        Uploaded_At_UTC,
+        Created_At_UTC,
+        Updated_At_UTC
+      )
       VALUES
-        (
-          @p1, 'submitted', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE()
-        );
+      (
+        @p1, 'submitted', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE()
+      );
     `;
 
     await query(headerSql, [reportNumber, uploaded_by]);
 
-    // 3) Stage rows into Stg_Invoice_Raw (do NOT insert DQ fields manually)
     const stageSql = `
-      INSERT INTO stg_invoice_raw
-        (
-          report_number,
-          customer_id,
-          member_number,
-          member_name,
-          member_address,
-          member_city,
-          member_state,
-          member_zip,
-          po,
-          invoice,
-          invoice_date,
-          ship_to,
-          ship_to_address,
-          ship_to_city,
-          ship_to_state,
-          ship_to_zip,
-          item,
-          manufacturer,
-          manufacturer_part,
-          um,
-          [desc],
-          unspsc,
-          category,
-          subcategory,
-          retail_price,
-          contract_price,
-          qty,
-          purchase_dollars,
-          caf,
-          caf_dollars,
-          created_at_utc
-        )
+      INSERT INTO dbo.Stg_Invoice_Raw
+      (
+        Report_Number,
+        Customer_ID,
+        Member_Number,
+        Member_Name,
+        Member_Address,
+        Member_City,
+        Member_State,
+        Member_Zip,
+        PO,
+        Invoice,
+        Invoice_Date,
+        Ship_To,
+        Ship_To_Address,
+        Ship_To_City,
+        Ship_To_State,
+        Ship_To_Zip,
+        Item,
+        Manufacturer,
+        Manufacturer_Part,
+        UM,
+        [Desc],
+        UNSPSC,
+        Category,
+        SubCategory,
+        Retail_Price,
+        Contract_Price,
+        Qty,
+        Purchase_Dollars,
+        CAF,
+        CAF_Dollars,
+        Created_At_UTC
+      )
       VALUES
-        (
-          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10,
-          @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19, @p20,
-          @p21, @p22, @p23, @p24, @p25, @p26, @p27, @p28, @p29, @p30,
-          GETUTCDATE()
-        );
+      (
+        @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10,
+        @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19, @p20,
+        @p21, @p22, @p23, @p24, @p25, @p26, @p27, @p28, @p29, @p30,
+        GETUTCDATE()
+      );
     `;
 
     for (const row of rows) {
@@ -847,28 +809,29 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       ]);
     }
 
-    // 4) If Return is linked to an Accrual, update original Accrual with this return #
     if (report_type === "Return" && related_report_number) {
       await query(
-        `UPDATE report_number
-         SET related_report_number = @p1,
-             updated_at_utc = GETUTCDATE()
-         WHERE report_number = @p2;`,
+        `
+        UPDATE dbo.Report_Number
+        SET related_report_number = @p1,
+            Updated_At_UTC = GETUTCDATE()
+        WHERE Report_Number = @p2;
+        `,
         [reportNumber, related_report_number],
       );
     }
 
-    // 5) Optional best-effort trigger for existing pipeline / Informatica job
     let trigger_result = null;
+
     try {
       if (process.env.PIPELINE_TRIGGER_URL) {
         const triggerPayload = {
           report_number: reportNumber,
           report_type,
           period,
-          bp_code,
-          contract_id,
-          related_report_number,
+          bp_code: bp_code || null,
+          contract_id: contract_id || null,
+          related_report_number: related_report_number || null,
           source: "manual_ui",
           uploaded_by,
         };
@@ -886,36 +849,52 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       }
     } catch (triggerErr) {
       console.warn(
-        "⚠️ Manual report pipeline trigger failed:",
+        "Manual report pipeline trigger failed:",
         triggerErr.message,
       );
+
       trigger_result = {
         ok: false,
         error: triggerErr.message,
       };
     }
 
-    // best-effort audit
     try {
       await query(
-        `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
-         VALUES (@p1,'manual_create_report',@p2,GETUTCDATE());`,
+        `
+        INSERT INTO dbo.Users_Audit_Log
+        (
+          User_Email,
+          Action,
+          Context_JSON,
+          Created_At_UTC
+        )
+        VALUES
+        (
+          @p1,
+          'manual_create_report',
+          @p2,
+          GETUTCDATE()
+        );
+        `,
         [
           uploaded_by,
           JSON.stringify({
             report_number: reportNumber,
             report_type,
             period,
-            bp_code,
-            contract_id,
-            related_report_number,
+            bp_code: bp_code || null,
+            contract_id: contract_id || null,
+            related_report_number: related_report_number || null,
             row_count: rows.length,
             staged_only: true,
             trigger_result,
           }),
         ],
       );
-    } catch {}
+    } catch (auditErr) {
+      console.warn("Manual report audit log skipped:", auditErr.message);
+    }
 
     res.json({
       ok: true,
@@ -928,7 +907,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         "Manual report created and staged for validation. Informatica processing will determine final DQ status.",
     });
   } catch (err) {
-    console.error("❌ POST /reports/manual-create error:", err);
+    console.error("POST /reports/manual-create error:", err);
     next(err);
   }
 });
