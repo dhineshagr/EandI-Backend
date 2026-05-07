@@ -238,14 +238,13 @@ router.get(
     try {
       const rn = asInt(req.params.reportNumber);
       const { status, dq } = req.query;
-      const limit = asInt(req.query.limit, 100);
-      const offset = asInt(req.query.offset, 0);
 
       let sql = `
       SELECT *
       FROM cur_invoice_detail
       WHERE report_number=@p1
     `;
+
       const params = [rn];
 
       if (status) {
@@ -261,14 +260,15 @@ router.get(
       }
 
       sql += `
-      ORDER BY cur_detail_id
-      OFFSET @p${params.length + 1} ROWS
-      FETCH NEXT @p${params.length + 2} ROWS ONLY;
+      ORDER BY cur_detail_id;
     `;
-      params.push(offset, limit);
 
       const { rows } = await query(sql, params);
-      res.json({ rows });
+
+      res.json({
+        rows,
+        count: rows.length,
+      });
     } catch (err) {
       console.error("❌ GET rows error:", err);
       next(err);
