@@ -421,4 +421,65 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
   }
 });
 
+/* ============================================================================
+   GET /api/uploads/lookups/suppliers?q=
+============================================================================ */
+router.get("/lookups/suppliers", requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+
+    if (q.length < 1) {
+      return res.json({ items: [] });
+    }
+
+    const { rows } = await query(
+      `
+      SELECT TOP 20
+        BP_Code AS bp_code
+      FROM dbo.Ref_Contract
+      WHERE BP_Code LIKE @p1
+      GROUP BY BP_Code
+      ORDER BY BP_Code;
+      `,
+      [`%${q}%`],
+    );
+
+    res.json({ items: rows || [] });
+  } catch (err) {
+    console.error("❌ supplier lookup error:", err);
+    res.status(500).json({ error: "Failed to search suppliers" });
+  }
+});
+
+/* ============================================================================
+   GET /api/uploads/lookups/contracts?q=
+============================================================================ */
+router.get("/lookups/contracts", requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+
+    if (q.length < 1) {
+      return res.json({ items: [] });
+    }
+
+    const { rows } = await query(
+      `
+      SELECT TOP 20
+        Contract_ID AS contract_id,
+        CAST(Contract_ID AS NVARCHAR(255)) AS contract_name
+      FROM dbo.Ref_Contract
+      WHERE CAST(Contract_ID AS NVARCHAR(255)) LIKE @p1
+      GROUP BY Contract_ID
+      ORDER BY Contract_ID;
+      `,
+      [`%${q}%`],
+    );
+
+    res.json({ items: rows || [] });
+  } catch (err) {
+    console.error("❌ contract lookup error:", err);
+    res.status(500).json({ error: "Failed to search contracts" });
+  }
+});
+
 export default router;
