@@ -12,6 +12,30 @@ const asInt = (v, d = 0) => {
   return Number.isFinite(n) ? n : d;
 };
 
+const nullIfEmpty = (value) => {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+
+  return value;
+};
+
+const nullableNumber = (value) => {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const numericValue = Number(value);
+
+  return Number.isFinite(numericValue) ? numericValue : null;
+};
+
+const reverseAmount = (value) => {
+  const numericValue = nullableNumber(value);
+
+  return numericValue === null ? null : numericValue * -1;
+};
+
 /* ======================================================================
    REGISTER REPORT (Metadata only)
 ====================================================================== */
@@ -1086,13 +1110,36 @@ router.get(
 
 /* ======================================================================
    MANUAL CREATE REPORT
-   - Supports Accrual and Return
-   - Supports legacy period
-   - Supports multiple periods
-   - Stores summary in Report_Number.Period
-   - Stores one row per period in Report_Period
-   - Stages detail rows for Informatica processing
+   ----------------------------------------------------------------------
+   Supported report types:
+
+   1. Report
+      - User manually enters rows.
+      - Linked report is not required.
+
+   2. Adjustment
+      - User manually enters rows.
+      - Linked original report is required.
+
+   3. Return
+      - Linked approved Accrual report is required.
+      - Manual rows are not required.
+      - Approved processed rows are copied from Cur_Invoice_Detail.
+      - Purchase_Dollars_Calc is reversed and inserted into
+        Stg_Invoice_Raw.Purchase_Dollars.
+      - CAF_Dollars is reversed.
+      - CAF rate, quantity, and prices remain unchanged.
+      - Supplier, Contract, and Periods are inherited from the Accrual.
+
+   Processing:
+      - Creates Report_Number with submitted status.
+      - Creates Report_Period records.
+      - Creates Cur_Invoice_Header.
+      - Inserts detail rows into Stg_Invoice_Raw.
+      - Existing scheduled IICS workflow processes submitted reports.
+      - Backend does not directly trigger Informatica.
 ====================================================================== */
+
 router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
   try {
     const {
@@ -1108,24 +1155,60 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       validation_error_details = "",
     } = req.body || {};
 
-    const allowedTypes = ["Accrual", "Return"];
+    /* ==================================================================
+       VALIDATE REPORT TYPE
+    ================================================================== */
+
+    const allowedTypes = ["Report", "Adjustment", "Return"];
 
     if (!allowedTypes.includes(report_type)) {
       return res.status(400).json({
-        error: "report_type must be Accrual or Return",
+        error: "report_type must be Report, Adjustment, or Return",
       });
     }
 
-    /*
-     * Support both:
-     *
-     * Legacy:
-     * period: "2026-04"
-     *
-     * New:
-     * periods: ["2026-04", "2026-05"]
-     */
-    const normalizedPeriods = Array.from(
+    const isReport = report_type === "Report";
+    const isAdjustment = report_type === "Adjustment";
+    const isReturn = report_type === "Return";
+
+    const requiresManualRows = isReport || isAdjustment;
+
+    /* ==================================================================
+       VALIDATE LINKED REPORT NUMBER
+    ================================================================== */
+
+    let linkedReportNumber = null;
+
+    if (isAdjustment || isReturn) {
+      linkedReportNumber = Number(related_report_number);
+
+      if (!Number.isInteger(linkedReportNumber) || linkedReportNumber <= 0) {
+        return res.status(400).json({
+          error: isReturn
+            ? "Linked Accrual Report # must be a positive integer"
+            : "Linked Original Report # must be a positive integer",
+        });
+      }
+    }
+
+    /* ==================================================================
+       VALIDATE MANUAL ROWS
+    ================================================================== */
+
+    if (requiresManualRows && (!Array.isArray(rows) || rows.length === 0)) {
+      return res.status(400).json({
+        error: `At least one detail row is required for a ${report_type}`,
+      });
+    }
+
+    /* ==================================================================
+       NORMALIZE SUBMITTED PERIODS
+
+       Report and Adjustment use submitted periods.
+       Return inherits periods from the linked Accrual.
+    ================================================================== */
+
+    const submittedPeriods = Array.from(
       new Set(
         [
           ...(Array.isArray(periods) ? periods : []),
@@ -1134,50 +1217,348 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
           .map((value) => String(value || "").trim())
           .filter(Boolean),
       ),
-    );
+    ).sort((left, right) => left.localeCompare(right));
 
-    if (normalizedPeriods.length === 0) {
+    if (!isReturn && submittedPeriods.length === 0) {
       return res.status(400).json({
-        error: "At least one period is required",
+        error: "At least one accounting period is required",
       });
     }
 
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return res.status(400).json({
-        error: "At least one detail row is required",
-      });
-    }
+    /* ==================================================================
+       USER INFORMATION
+    ================================================================== */
 
-    /*
-     * Keep Report_Number.Period populated for backward compatibility.
-     */
-    const periodSummary = normalizedPeriods.join(", ");
+    const uploadedBy = req.user?.email || req.user?.username || "unknown@user";
 
-    const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
-
-    const uploaded_by_name =
+    const uploadedByName =
       req.user?.display_name ||
       req.user?.name ||
       req.user?.username ||
       (req.user?.email ? req.user.email.split("@")[0] : "Unknown");
 
-    const uploaded_by_type = req.user?.user_type || "internal";
+    const uploadedByType = req.user?.user_type || "internal";
 
     /*
-     * BP users must use their assigned BP code.
-     * Internal users may use the submitted BP code.
+     * BP users must use the supplier code assigned to their login.
+     * Internal users can use the supplier code selected in the UI.
      */
-    const finalBpCode =
-      req.user?.user_type === "bp"
+    const submittedBpCode =
+      String(req.user?.user_type || "").toLowerCase() === "bp"
         ? req.user?.bp_code || bp_code || null
         : bp_code || null;
 
-    const manualFileName =
-      report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
+    /* ==================================================================
+       RESOLVED VALUES
+
+       Report and Adjustment:
+       - Use submitted Supplier, Contract, Periods, and rows.
+
+       Return:
+       - Inherit Supplier, Contract, and Periods.
+       - Copy approved processed Accrual rows.
+    ================================================================== */
+
+    let resolvedPeriods = [...submittedPeriods];
+
+    let resolvedBpCode = nullIfEmpty(
+      typeof submittedBpCode === "string"
+        ? submittedBpCode.trim()
+        : submittedBpCode,
+    );
+
+    let resolvedContractId = nullIfEmpty(
+      typeof contract_id === "string" ? contract_id.trim() : contract_id,
+    );
+
+    let linkedReport = null;
+    let detailRowsToStage = [];
 
     /* ==================================================================
-       CREATE REPORT HEADER
+       VALIDATE ADJUSTMENT LINKED REPORT
     ================================================================== */
+
+    if (isAdjustment) {
+      const { rows: linkedRows } = await query(
+        `
+        SELECT
+          Report_Number AS report_number,
+          Report_Type AS report_type,
+          FileName AS filename,
+          Period AS period,
+          BP_Code AS bp_code,
+          Contract_ID AS contract_id,
+          Status AS status
+        FROM dbo.Report_Number
+        WHERE Report_Number = @p1;
+        `,
+        [linkedReportNumber],
+      );
+
+      if (!linkedRows.length) {
+        return res.status(404).json({
+          error: `Linked report #${linkedReportNumber} was not found`,
+        });
+      }
+
+      linkedReport = linkedRows[0];
+    }
+
+    /* ==================================================================
+       LOAD RETURN SOURCE ACCRUAL
+    ================================================================== */
+
+    if (isReturn) {
+      /*
+       * Load and validate the linked Accrual header.
+       */
+      const { rows: linkedRows } = await query(
+        `
+        SELECT
+          Report_Number AS report_number,
+          Report_Type AS report_type,
+          FileName AS filename,
+          Period AS period,
+          BP_Code AS bp_code,
+          Contract_ID AS contract_id,
+          Status AS status
+        FROM dbo.Report_Number
+        WHERE Report_Number = @p1;
+        `,
+        [linkedReportNumber],
+      );
+
+      if (!linkedRows.length) {
+        return res.status(404).json({
+          error:
+            `Linked Accrual report #${linkedReportNumber} ` + "was not found",
+        });
+      }
+
+      linkedReport = linkedRows[0];
+
+      const linkedReportType = String(linkedReport.report_type || "")
+        .trim()
+        .toLowerCase();
+
+      if (linkedReportType !== "accrual") {
+        return res.status(400).json({
+          error:
+            `Report #${linkedReportNumber} is report type ` +
+            `"${linkedReport.report_type || "Unknown"}". ` +
+            "A Return must be linked to an Accrual report.",
+        });
+      }
+
+      /*
+       * A Return can be created only after the source Accrual
+       * has been approved.
+       */
+      const linkedReportStatus = String(linkedReport.status || "")
+        .trim()
+        .toLowerCase();
+
+      if (linkedReportStatus !== "approved") {
+        return res.status(400).json({
+          error:
+            `Linked Accrual report #${linkedReportNumber} has status ` +
+            `"${linkedReport.status || "Unknown"}". ` +
+            "The Accrual must be approved before a Return can be created.",
+        });
+      }
+
+      /*
+       * Return inherits Supplier and Contract from the Accrual.
+       */
+      resolvedBpCode = nullIfEmpty(linkedReport.bp_code);
+      resolvedContractId = nullIfEmpty(linkedReport.contract_id);
+
+      /*
+       * Load normalized periods from Report_Period.
+       */
+      const { rows: linkedPeriodRows } = await query(
+        `
+        SELECT DISTINCT
+          Period AS period
+        FROM dbo.Report_Period
+        WHERE Report_Number = @p1
+          AND Period IS NOT NULL
+          AND LTRIM(
+                RTRIM(
+                  CAST(Period AS NVARCHAR(50))
+                )
+              ) <> ''
+        ORDER BY Period;
+        `,
+        [linkedReportNumber],
+      );
+
+      resolvedPeriods = linkedPeriodRows
+        .map((item) => String(item.period || "").trim())
+        .filter(Boolean);
+
+      /*
+       * Fallback for older reports that store only
+       * Report_Number.Period.
+       */
+      if (resolvedPeriods.length === 0 && linkedReport.period) {
+        resolvedPeriods = String(linkedReport.period)
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean);
+      }
+
+      resolvedPeriods = Array.from(new Set(resolvedPeriods)).sort(
+        (left, right) => left.localeCompare(right),
+      );
+
+      if (resolvedPeriods.length === 0) {
+        return res.status(400).json({
+          error:
+            `Linked Accrual report #${linkedReportNumber} ` +
+            "does not contain an accounting period.",
+        });
+      }
+
+      /*
+       * Copy approved processed rows from Cur_Invoice_Detail.
+       *
+       * Verified source columns:
+       * - Description
+       * - Purchase_Dollars_Calc
+       * - CAF
+       * - CAF_Dollars
+       */
+      const { rows: sourceRows } = await query(
+        `
+        SELECT
+          Customer_ID AS customer_id,
+          Member_Number AS member_number,
+          Member_Name AS member_name,
+          Member_Address AS member_address,
+          Member_City AS member_city,
+          Member_State AS member_state,
+          Member_Zip AS member_zip,
+
+          PO AS po,
+          Invoice AS invoice,
+          Invoice_Date AS invoice_date,
+
+          Ship_To AS ship_to,
+          Ship_To_Address AS ship_to_address,
+          Ship_To_City AS ship_to_city,
+          Ship_To_State AS ship_to_state,
+          Ship_To_Zip AS ship_to_zip,
+
+          Item AS item,
+          Manufacturer AS manufacturer,
+          Manufacturer_Part AS manufacturer_part,
+          UM AS um,
+          Description AS description,
+          UNSPSC AS unspsc,
+          Category AS category,
+          SubCategory AS subcategory,
+
+          Retail_Price AS retail_price,
+          Contract_Price AS contract_price,
+          Qty AS qty,
+
+          Purchase_Dollars_Calc AS purchase_dollars,
+          CAF AS caf,
+          CAF_Dollars AS caf_dollars
+
+        FROM dbo.Cur_Invoice_Detail
+        WHERE Report_Number = @p1
+          AND LOWER(
+                LTRIM(
+                  RTRIM(
+                    COALESCE(DQ_Status, '')
+                  )
+                )
+              ) = 'approved'
+        ORDER BY Cur_Detail_ID;
+        `,
+        [linkedReportNumber],
+      );
+
+      if (!sourceRows.length) {
+        return res.status(400).json({
+          error:
+            `Linked Accrual report #${linkedReportNumber} ` +
+            "does not contain approved processed rows in " +
+            "Cur_Invoice_Detail. The Accrual must be approved " +
+            "before a Return can be created.",
+        });
+      }
+
+      /*
+       * Build Return staging rows.
+       *
+       * Reverse:
+       * - Purchase_Dollars_Calc
+       * - CAF_Dollars
+       *
+       * Keep unchanged:
+       * - CAF rate
+       * - Quantity
+       * - Retail Price
+       * - Contract Price
+       * - Member, invoice, item, and shipping data
+       */
+      detailRowsToStage = sourceRows.map((sourceRow) => ({
+        ...sourceRow,
+
+        purchase_dollars: reverseAmount(sourceRow.purchase_dollars),
+
+        caf_dollars: reverseAmount(sourceRow.caf_dollars),
+      }));
+    } else {
+      /*
+       * Report and Adjustment use rows entered through the UI.
+       */
+      detailRowsToStage = rows;
+    }
+
+    if (!Array.isArray(detailRowsToStage) || detailRowsToStage.length === 0) {
+      return res.status(400).json({
+        error: "No detail rows are available to create the report",
+      });
+    }
+
+    /* ==================================================================
+       PERIOD SUMMARY
+    ================================================================== */
+
+    const periodSummary = resolvedPeriods.join(", ");
+
+    /* ==================================================================
+       MANUAL FILE NAME
+    ================================================================== */
+
+    const manualFileName =
+      report_type === "Report"
+        ? "MANUAL_REPORT"
+        : report_type === "Adjustment"
+          ? "MANUAL_ADJUSTMENT"
+          : "MANUAL_RETURN";
+
+    /* ==================================================================
+       REPORT NOTE
+    ================================================================== */
+
+    const finalNote = isReturn
+      ? [
+          String(note || "").trim(),
+          `Automatically reversed from Accrual Report #${linkedReportNumber}`,
+        ]
+          .filter(Boolean)
+          .join(" - ")
+      : String(note || "").trim();
+
+    /* ==================================================================
+       CREATE REPORT_NUMBER HEADER
+    ================================================================== */
+
     const reportInsertSql = `
       INSERT INTO dbo.Report_Number
       (
@@ -1208,7 +1589,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         INSERTED.Uploaded_By_Name AS uploaded_by_name,
         INSERTED.Uploaded_By_Type AS uploaded_by_type,
         INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
-        INSERTED.Status AS status
+        INSERTED.Status AS status,
+        INSERTED.Note AS note
       VALUES
       (
         @p1,
@@ -1231,17 +1613,18 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     const { rows: reportRows } = await query(reportInsertSql, [
       manualFileName,
       report_type,
-      uploaded_by,
-      uploaded_by_name,
-      uploaded_by_type,
+      uploadedBy,
+      uploadedByName,
+      uploadedByType,
       periodSummary,
-      finalBpCode,
-      contract_id || null,
-      related_report_number || null,
-      note || "",
+      resolvedBpCode,
+      resolvedContractId,
+      linkedReportNumber,
+      finalNote,
     ]);
 
     const report = reportRows?.[0];
+
     const reportNumber = report?.report_number ?? report?.Report_Number ?? null;
 
     if (!reportNumber) {
@@ -1251,9 +1634,10 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     }
 
     /* ==================================================================
-       STORE SELECTED PERIODS
+       STORE REPORT PERIODS
     ================================================================== */
-    for (const selectedPeriod of normalizedPeriods) {
+
+    for (const selectedPeriod of resolvedPeriods) {
       await query(
         `
         INSERT INTO dbo.Report_Period
@@ -1278,6 +1662,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     /* ==================================================================
        CREATE CURATED HEADER
     ================================================================== */
+
     await query(
       `
       INSERT INTO dbo.Cur_Invoice_Header
@@ -1299,12 +1684,22 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         GETUTCDATE()
       );
       `,
-      [reportNumber, uploaded_by],
+      [reportNumber, uploadedBy],
     );
 
     /* ==================================================================
-       STAGE DETAIL ROWS
+       INSERT STAGING ROWS
+
+       Verified Stg_Invoice_Raw columns:
+       - Desc
+       - Purchase_Dollars
+       - CAF
+       - CAF_Dollars
+
+       Load_Batch_ID and Source_Hash are not inserted here and must
+       remain nullable or have database defaults.
     ================================================================== */
+
     const stageSql = `
       INSERT INTO dbo.Stg_Invoice_Raw
       (
@@ -1316,14 +1711,17 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         Member_City,
         Member_State,
         Member_Zip,
+
         PO,
         Invoice,
         Invoice_Date,
+
         Ship_To,
         Ship_To_Address,
         Ship_To_City,
         Ship_To_State,
         Ship_To_Zip,
+
         Item,
         Manufacturer,
         Manufacturer_Part,
@@ -1332,12 +1730,14 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         UNSPSC,
         Category,
         SubCategory,
+
         Retail_Price,
         Contract_Price,
         Qty,
         Purchase_Dollars,
         CAF,
         CAF_Dollars,
+
         Created_At_UTC
       )
       VALUES
@@ -1350,14 +1750,17 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         @p6,
         @p7,
         @p8,
+
         @p9,
         @p10,
         @p11,
+
         @p12,
         @p13,
         @p14,
         @p15,
         @p16,
+
         @p17,
         @p18,
         @p19,
@@ -1366,97 +1769,75 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         @p22,
         @p23,
         @p24,
+
         @p25,
         @p26,
         @p27,
         @p28,
         @p29,
         @p30,
+
         GETUTCDATE()
       );
     `;
 
-    for (const row of rows) {
+    for (const row of detailRowsToStage) {
       await query(stageSql, [
         reportNumber,
-        row.customer_id || null,
-        row.member_number || null,
-        row.member_name || null,
-        row.member_address || null,
-        row.member_city || null,
-        row.member_state || null,
-        row.member_zip || null,
-        row.po || null,
-        row.invoice || null,
-        row.invoice_date || null,
-        row.ship_to || null,
-        row.ship_to_address || null,
-        row.ship_to_city || null,
-        row.ship_to_state || null,
-        row.ship_to_zip || null,
-        row.item || null,
-        row.manufacturer || null,
-        row.manufacturer_part || null,
-        row.um || null,
-        row.desc || row.description || null,
-        row.unspsc || null,
-        row.category || null,
-        row.subcategory || null,
-        row.retail_price ?? null,
-        row.contract_price ?? null,
-        row.qty ?? null,
-        row.purchase_dollars ?? row.purchase_dollars_calc ?? null,
-        row.caf ?? null,
-        row.caf_dollars ?? null,
+
+        nullIfEmpty(row.customer_id),
+        nullIfEmpty(row.member_number),
+        nullIfEmpty(row.member_name),
+        nullIfEmpty(row.member_address),
+        nullIfEmpty(row.member_city),
+        nullIfEmpty(row.member_state),
+        nullIfEmpty(row.member_zip),
+
+        nullIfEmpty(row.po),
+        nullIfEmpty(row.invoice),
+        nullIfEmpty(row.invoice_date),
+
+        nullIfEmpty(row.ship_to),
+        nullIfEmpty(row.ship_to_address),
+        nullIfEmpty(row.ship_to_city),
+        nullIfEmpty(row.ship_to_state),
+        nullIfEmpty(row.ship_to_zip),
+
+        nullIfEmpty(row.item),
+        nullIfEmpty(row.manufacturer),
+        nullIfEmpty(row.manufacturer_part),
+        nullIfEmpty(row.um),
+
+        nullIfEmpty(row.desc ?? row.description),
+
+        nullIfEmpty(row.unspsc),
+        nullIfEmpty(row.category),
+        nullIfEmpty(row.subcategory),
+
+        nullableNumber(row.retail_price),
+        nullableNumber(row.contract_price),
+        nullableNumber(row.qty),
+
+        nullableNumber(row.purchase_dollars ?? row.purchase_dollars_calc),
+
+        nullableNumber(row.caf),
+        nullableNumber(row.caf_dollars),
       ]);
     }
 
     /* ==================================================================
-       TRIGGER INFORMATICA / PROCESSING PIPELINE
-    ================================================================== */
-    let trigger_result = null;
-
-    try {
-      if (process.env.PIPELINE_TRIGGER_URL) {
-        const triggerRes = await fetch(process.env.PIPELINE_TRIGGER_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            report_number: reportNumber,
-            report_type,
-            period: periodSummary,
-            periods: normalizedPeriods,
-            bp_code: finalBpCode,
-            contract_id: contract_id || null,
-            related_report_number: related_report_number || null,
-            source: "manual_ui",
-            uploaded_by,
-          }),
-        });
-
-        trigger_result = {
-          ok: triggerRes.ok,
-          status: triggerRes.status,
-        };
-      }
-    } catch (triggerErr) {
-      trigger_result = {
-        ok: false,
-        error: triggerErr.message,
-      };
-
-      console.warn(
-        "Manual report pipeline trigger failed:",
-        triggerErr.message,
-      );
-    }
-
-    /* ==================================================================
        AUDIT LOG
+
+       Audit failure does not fail report creation.
     ================================================================== */
+
     try {
+      const auditAction = isReturn
+        ? "manual_create_return"
+        : isAdjustment
+          ? "manual_create_adjustment"
+          : "manual_create_report";
+
       await query(
         `
         INSERT INTO dbo.Users_Audit_Log
@@ -1469,52 +1850,99 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         VALUES
         (
           @p1,
-          'manual_create_report',
           @p2,
+          @p3,
           GETUTCDATE()
         );
         `,
         [
-          uploaded_by,
+          uploadedBy,
+          auditAction,
+
           JSON.stringify({
             report_number: reportNumber,
             report_type,
+            filename: manualFileName,
+
             period: periodSummary,
-            periods: normalizedPeriods,
-            bp_code: finalBpCode,
-            contract_id: contract_id || null,
-            related_report_number: related_report_number || null,
-            row_count: rows.length,
-            validation_warnings,
-            validation_error_details,
-            trigger_result,
+            periods: resolvedPeriods,
+
+            bp_code: resolvedBpCode,
+            contract_id: resolvedContractId,
+
+            related_report_number: linkedReportNumber,
+
+            source_report_type: linkedReport?.report_type || null,
+
+            source_row_count: isReturn ? detailRowsToStage.length : null,
+
+            row_count: detailRowsToStage.length,
+
+            reversed_fields: isReturn
+              ? ["purchase_dollars_calc", "caf_dollars"]
+              : [],
+
+            validation_warnings: isReturn ? [] : validation_warnings,
+
+            validation_error_details: isReturn ? "" : validation_error_details,
+
+            processing_method: "scheduled_iics_workflow",
           }),
         ],
       );
-    } catch (auditErr) {
-      console.warn("Manual report audit log skipped:", auditErr.message);
+    } catch (auditError) {
+      console.warn("Manual report audit log skipped:", auditError.message);
     }
 
     /* ==================================================================
        RESPONSE
     ================================================================== */
-    res.json({
+
+    const message = isReturn
+      ? `Return report #${reportNumber} was created from Accrual Report #${linkedReportNumber}. ${detailRowsToStage.length} approved processed row(s) were copied and reversed. The report is ready for scheduled Informatica processing.`
+      : `${report_type} report #${reportNumber} was created and staged for scheduled Informatica processing.`;
+
+    return res.json({
       ok: true,
+
       report_number: reportNumber,
+
       report: {
         ...report,
+
         period: periodSummary,
-        periods: normalizedPeriods,
+        periods: resolvedPeriods,
+
+        bp_code: resolvedBpCode,
+        contract_id: resolvedContractId,
+
+        related_report_number: linkedReportNumber,
       },
-      row_count: rows.length,
+
+      source_report: isReturn
+        ? {
+            report_number: linkedReport.report_number,
+
+            report_type: linkedReport.report_type,
+
+            status: linkedReport.status,
+
+            row_count: detailRowsToStage.length,
+          }
+        : null,
+
+      row_count: detailRowsToStage.length,
+
       status: "submitted",
-      trigger_result,
-      message:
-        "Manual report created and staged for validation. Informatica processing will determine final DQ status.",
+
+      processing_method: "scheduled_iics_workflow",
+
+      message,
     });
-  } catch (err) {
-    console.error("❌ POST /reports/manual-create error:", err);
-    next(err);
+  } catch (error) {
+    console.error("❌ POST /reports/manual-create error:", error);
+
+    next(error);
   }
 });
 
