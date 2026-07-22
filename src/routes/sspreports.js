@@ -32,13 +32,13 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       limit = 25,
     } = req.query;
 
-    const pageNum = Number(page) || 1;
-    const pageSize = Number(limit) || 25;
+    const pageNum = Math.max(1, Number(page) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number(limit) || 25));
     const offset = (pageNum - 1) * pageSize;
 
     const validSortFields = [
       "report_number",
-      "related_report_number", // ✅ NEW
+      "related_report_number",
       "report_type",
       "file_name",
       "uploaded_by_display",
@@ -62,22 +62,24 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     const values = [];
     let idx = 1;
 
-    /* ============================
-       🔍 SEARCH
-    ============================ */
+    /* ================================================================
+       SEARCH AND FILTERS
+    ================================================================ */
     if (search) {
       conditions.push(`
         (
           CAST(rn.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
-          OR CAST(rn.Related_Report_Number AS NVARCHAR(50)) LIKE @p${idx}  -- ✅ NEW
+          OR CAST(rn.Related_Report_Number AS NVARCHAR(50)) LIKE @p${idx}
           OR rn.Filename LIKE @p${idx}
           OR rn.Uploaded_By LIKE @p${idx}
           OR rn.Uploaded_By_Name LIKE @p${idx}
           OR rn.Period LIKE @p${idx}
+          OR period_data.selected_periods LIKE @p${idx}
           OR rn.BP_Code LIKE @p${idx}
-          OR rn.Contract_ID LIKE @p${idx}
+          OR CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}
         )
       `);
+
       values.push(`%${search}%`);
       idx++;
     }
@@ -89,13 +91,24 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     }
 
     if (contract) {
-      conditions.push(`rn.Contract_ID LIKE @p${idx}`);
+      conditions.push(`CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}`);
       values.push(`%${contract}%`);
       idx++;
     }
 
     if (member) {
-      conditions.push(`d.Member_Number LIKE @p${idx}`);
+      conditions.push(`
+        EXISTS (
+          SELECT 1
+          FROM Cur_Invoice_Detail member_detail
+          WHERE member_detail.Report_Number = rn.Report_Number
+            AND (
+              member_detail.Member_Number LIKE @p${idx}
+              OR member_detail.Member_Name LIKE @p${idx}
+            )
+        )
+      `);
+
       values.push(`%${member}%`);
       idx++;
     }
@@ -106,16 +119,18 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           ? "h.Approved_At_Utc"
           : "rn.Uploaded_At_Utc";
 
-      if (startDate && endDate) {
-        conditions.push(`${dateColumn} BETWEEN @p${idx} AND @p${idx + 1}`);
-        values.push(startDate, endDate);
-        idx += 2;
-      } else if (startDate) {
+      if (startDate) {
         conditions.push(`${dateColumn} >= @p${idx}`);
         values.push(startDate);
         idx++;
-      } else if (endDate) {
-        conditions.push(`${dateColumn} <= @p${idx}`);
+      }
+
+      if (endDate) {
+        /*
+         * Treat endDate as the complete selected day instead of midnight
+         * at the beginning of that day.
+         */
+        conditions.push(`${dateColumn} < DATEADD(DAY, 1, @p${idx})`);
         values.push(endDate);
         idx++;
       }
@@ -127,81 +142,174 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const statusList = String(statuses || "")
       .split(",")
-      .map((s) => s.trim().toLowerCase())
+      .map((status) => status.trim().toLowerCase())
       .filter(Boolean);
+
+    const statusFilterParams = statusList.map(
+      (_, statusIndex) => `@p${idx + statusIndex}`,
+    );
 
     const statusFilterSql =
       statusList.length > 0
-        ? `WHERE base.report_status IN (${statusList
-            .map((_, i) => `@p${idx + i}`)
-            .join(", ")})`
+        ? `WHERE base.report_status IN (${statusFilterParams.join(", ")})`
         : "";
-
-    const statusFilterValuesStartIdx = idx;
 
     if (statusList.length > 0) {
       values.push(...statusList);
       idx += statusList.length;
     }
 
-    /* ============================
-       MAIN QUERY
-    ============================ */
-    const sql = `
+    /*
+     * Use one shared CTE for both the data query and count query.
+     * Periods are aggregated before detail rows are counted, preventing
+     * Report_Period from multiplying Cur_Invoice_Detail rows.
+     */
+    const baseCte = `
       ;WITH base AS (
         SELECT
           rn.Report_Number AS report_number,
-          rn.Related_Report_Number AS related_report_number,  -- ✅ NEW
-          rn.Report_Type   AS report_type,
-          rn.Filename      AS file_name,
-          rn.Period        AS period,
-          rn.BP_Code       AS bp_code,
-          rn.Contract_ID   AS contract_id,
+          rn.Related_Report_Number AS related_report_number,
+          rn.Report_Type AS report_type,
+          rn.Filename AS file_name,
 
-          rn.Uploaded_By      AS uploaded_by,
+          COALESCE(
+            NULLIF(period_data.selected_periods, ''),
+            NULLIF(rn.Period, '')
+          ) AS period,
+
+          rn.BP_Code AS bp_code,
+          rn.Contract_ID AS contract_id,
+
+          rn.Uploaded_By AS uploaded_by,
           rn.Uploaded_By_Name AS uploaded_by_name,
-          COALESCE(NULLIF(rn.Uploaded_By_Name, ''), NULLIF(rn.Uploaded_By, ''), 'System') AS uploaded_by_display,
+
+          COALESCE(
+            NULLIF(rn.Uploaded_By_Name, ''),
+            NULLIF(rn.Uploaded_By, ''),
+            'System'
+          ) AS uploaded_by_display,
 
           rn.Uploaded_At_Utc AS uploaded_at_utc,
 
-          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'passed' THEN 1 ELSE 0 END) AS passed_count,
-          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-          SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+          COUNT(d.Cur_Detail_ID) AS total_rows,
 
-          COALESCE(SUM(CAST(d.Purchase_Dollars_Calc AS FLOAT)), 0) AS total_purchase,
-          COALESCE(SUM(CAST(d.CAF_Dollars AS FLOAT)), 0) AS total_caf,
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+                THEN 1
+              ELSE 0
+            END
+          ) AS passed_count,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                THEN 1
+              ELSE 0
+            END
+          ) AS failed_count,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                THEN 1
+              ELSE 0
+            END
+          ) AS approved_count,
+
+          COALESCE(
+            SUM(TRY_CAST(d.Purchase_Dollars_Calc AS DECIMAL(19, 2))),
+            0
+          ) AS total_purchase,
+
+          COALESCE(
+            SUM(TRY_CAST(d.CAF_Dollars AS DECIMAL(19, 2))),
+            0
+          ) AS total_caf,
 
           LOWER(
             CASE
-              WHEN LOWER(COALESCE(NULLIF(h.Report_Status,''),'')) = 'approved'
-                   OR LOWER(COALESCE(NULLIF(rn.Status,''),'')) = 'approved'
-                THEN 'approved'
-
-              WHEN SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) > 0
-                THEN 'failed'
-
-              WHEN COUNT(d.Report_Number) > 0
-                   AND SUM(CASE WHEN LOWER(COALESCE(d.DQ_Status,'')) = 'failed' THEN 1 ELSE 0 END) = 0
-                THEN 'passed'
-
-              WHEN LOWER(COALESCE(NULLIF(rn.Status,''),'')) IN ('new','staged')
+              WHEN UPPER(LTRIM(RTRIM(rn.Filename))) = 'ZERO_SALES'
+                OR UPPER(LTRIM(RTRIM(rn.Filename))) LIKE 'ZERO_SALES%'
                 THEN 'submitted'
 
-              ELSE COALESCE(NULLIF(LOWER(rn.Status),''), 'submitted')
+              WHEN LOWER(COALESCE(NULLIF(h.Report_Status, ''), '')) =
+                   'approved'
+                OR LOWER(COALESCE(NULLIF(rn.Status, ''), '')) =
+                   'approved'
+                THEN 'approved'
+
+              WHEN SUM(
+                CASE
+                  WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                    THEN 1
+                  ELSE 0
+                END
+              ) > 0
+                THEN 'failed'
+
+              WHEN COUNT(d.Cur_Detail_ID) > 0
+                AND SUM(
+                  CASE
+                    WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                      THEN 1
+                    ELSE 0
+                  END
+                ) = COUNT(d.Cur_Detail_ID)
+                THEN 'approved'
+
+              WHEN COUNT(d.Cur_Detail_ID) > 0
+                AND SUM(
+                  CASE
+                    WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                      THEN 1
+                    ELSE 0
+                  END
+                ) = 0
+                THEN 'passed'
+
+              WHEN LOWER(COALESCE(NULLIF(rn.Status, ''), '')) IN
+                   ('new', 'staged', 'pending', 'submitted')
+                THEN 'submitted'
+
+              ELSE COALESCE(
+                NULLIF(LOWER(rn.Status), ''),
+                'submitted'
+              )
             END
           ) AS report_status
 
         FROM Report_Number rn
-        LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
-        LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number
+
+        LEFT JOIN Cur_Invoice_Header h
+          ON h.Report_Number = rn.Report_Number
+
+        LEFT JOIN Cur_Invoice_Detail d
+          ON d.Report_Number = rn.Report_Number
+
+        OUTER APPLY (
+          SELECT
+            STRING_AGG(
+              CAST(period_rows.Period AS NVARCHAR(50)),
+              ', '
+            ) AS selected_periods
+          FROM (
+            SELECT DISTINCT rp.Period
+            FROM Report_Period rp
+            WHERE rp.Report_Number = rn.Report_Number
+              AND rp.Period IS NOT NULL
+          ) period_rows
+        ) period_data
+
         ${whereClause}
 
         GROUP BY
           rn.Report_Number,
-          rn.Related_Report_Number, -- ✅ NEW
+          rn.Related_Report_Number,
           rn.Report_Type,
           rn.Filename,
           rn.Period,
+          period_data.selected_periods,
           rn.BP_Code,
           rn.Contract_ID,
           rn.Uploaded_By,
@@ -210,42 +318,54 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           rn.Status,
           h.Report_Status
       )
+    `;
+
+    const dataSql = `
+      ${baseCte}
+
       SELECT *
       FROM base
       ${statusFilterSql}
       ORDER BY ${sortField} ${sortOrder}
-      OFFSET @p${idx} ROWS FETCH NEXT @p${idx + 1} ROWS ONLY;
+      OFFSET @p${idx} ROWS
+      FETCH NEXT @p${idx + 1} ROWS ONLY;
     `;
 
-    const { rows } = await query(sql, [...values, offset, pageSize]);
+    const { rows } = await query(dataSql, [...values, offset, pageSize]);
 
-    /* ============================
-       COUNT QUERY
-    ============================ */
     const countSql = `
-      ;WITH base AS (
-        SELECT
-          rn.Report_Number AS report_number
-        FROM Report_Number rn
-        LEFT JOIN Cur_Invoice_Header h ON h.Report_Number = rn.Report_Number
-        LEFT JOIN Cur_Invoice_Detail d ON d.Report_Number = rn.Report_Number
-        ${whereClause}
-        GROUP BY rn.Report_Number, rn.Status, h.Report_Status
-      )
-      SELECT COUNT(*) AS total FROM base;
+      ${baseCte}
+
+      SELECT COUNT(*) AS total
+      FROM base
+      ${statusFilterSql};
     `;
 
     const countResult = await query(countSql, values);
 
+    const reports = rows.map((report) => {
+      const periods = String(report.period || "")
+        .split(",")
+        .map((periodValue) => periodValue.trim())
+        .filter(Boolean);
+
+      return {
+        ...report,
+        periods,
+      };
+    });
+
     res.json({
-      reports: rows,
-      total: countResult.rows[0]?.total || 0,
+      reports,
+      total: Number(countResult.rows[0]?.total || 0),
       page: pageNum,
       limit: pageSize,
     });
   } catch (err) {
     console.error("❌ SSP reports error:", err);
-    res.status(500).json({ error: "Failed to load SSP reports" });
+    res.status(500).json({
+      error: "Failed to load SSP reports",
+    });
   }
 });
 

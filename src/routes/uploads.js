@@ -15,40 +15,42 @@ const router = express.Router();
 function normalizeName(input) {
   if (!input) return "";
 
-  let s = String(input);
+  let value = String(input);
 
-  // take only last segment if it's a blob path
-  s = s.split("/").pop();
+  // Take only the last segment when the input is a blob path
+  value = value.split("/").pop();
 
-  // decode any %xx encoding safely
+  // Decode URL encoding safely
   try {
-    s = decodeURIComponent(s);
-  } catch {}
+    value = decodeURIComponent(value);
+  } catch {
+    // Keep the original value if decoding fails
+  }
 
-  s = s.trim().toLowerCase();
+  value = value.trim().toLowerCase();
 
-  // remove common timestamp prefixes like: 20260105_ or 2026-01-05t123000_
-  // also handles 2026-01-05T1937_ (your real example)
-  s = s.replace(/^(\d{4}[-]?\d{2}[-]?\d{2}(t?\d{3,})?[_-]+)/i, "");
+  // Remove common timestamp prefixes
+  value = value.replace(/^(\d{4}[-]?\d{2}[-]?\d{2}(t?\d{3,})?[_-]+)/i, "");
 
-  // normalize separators: spaces, underscores, dashes -> single space
-  s = s.replace(/[\s_-]+/g, " ");
+  // Normalize spaces, underscores, and dashes
+  value = value.replace(/[\s_-]+/g, " ");
 
-  // remove punctuation except dot (keep extension)
-  s = s.replace(/[^\w.\s]/g, "");
+  // Remove punctuation except the file-extension dot
+  value = value.replace(/[^\w.\s]/g, "");
 
-  // collapse multiple spaces
-  s = s.replace(/\s+/g, " ").trim();
+  // Collapse repeated spaces
+  value = value.replace(/\s+/g, " ").trim();
 
-  return s;
+  return value;
 }
 
 function getContentTypeByExt(filename) {
-  const ext = (path.extname(filename || "").toLowerCase() || "").replace(
+  const extension = (path.extname(filename || "").toLowerCase() || "").replace(
     ".",
     "",
   );
-  const map = {
+
+  const contentTypes = {
     csv: "text/csv",
     txt: "text/plain",
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -56,7 +58,8 @@ function getContentTypeByExt(filename) {
     pdf: "application/pdf",
     json: "application/json",
   };
-  return map[ext] || "application/octet-stream";
+
+  return contentTypes[extension] || "application/octet-stream";
 }
 
 async function findBlobByLooseName(
@@ -64,24 +67,36 @@ async function findBlobByLooseName(
   containers,
   requestedName,
 ) {
-  const reqNorm = normalizeName(requestedName);
+  const requestedNormalizedName = normalizeName(requestedName);
 
   for (const containerName of containers) {
     const containerClient = blobServiceClient.getContainerClient(containerName);
-    if (!(await containerClient.exists())) continue;
 
-    // NOTE: This scans blobs; long term you should store container+blobName in DB
+    if (!(await containerClient.exists())) {
+      continue;
+    }
+
+    // This scans blobs. Long term, store the exact container/blob name in DB.
     for await (const blob of containerClient.listBlobsFlat()) {
-      const blobNorm = normalizeName(blob.name);
+      const blobNormalizedName = normalizeName(blob.name);
 
-      // Exact normalized match is best
-      if (blobNorm === reqNorm) {
-        return { containerClient, blobName: blob.name };
+      // Exact normalized match
+      if (blobNormalizedName === requestedNormalizedName) {
+        return {
+          containerClient,
+          blobName: blob.name,
+        };
       }
 
-      // Loose contains match as fallback (helps when DB has display name)
-      if (blobNorm.includes(reqNorm) || reqNorm.includes(blobNorm)) {
-        return { containerClient, blobName: blob.name };
+      // Loose contains match
+      if (
+        blobNormalizedName.includes(requestedNormalizedName) ||
+        requestedNormalizedName.includes(blobNormalizedName)
+      ) {
+        return {
+          containerClient,
+          blobName: blob.name,
+        };
       }
     }
   }
@@ -89,9 +104,88 @@ async function findBlobByLooseName(
   return null;
 }
 
+function isValidPeriod(value) {
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(String(value || "").trim());
+}
+
+function normalizePeriods(period, periods) {
+  const values = [];
+
+  if (Array.isArray(periods)) {
+    values.push(...periods);
+  }
+
+  /*
+    Backward compatibility:
+    Existing frontend sends a single "period".
+    New frontend will send a "periods" array.
+  */
+  if (period !== null && period !== undefined && String(period).trim() !== "") {
+    values.push(period);
+  }
+
+  return [
+    ...new Set(
+      values.map((value) => String(value || "").trim()).filter(Boolean),
+    ),
+  ].sort();
+}
+
+function buildPeriodSummary(periods) {
+  if (!periods.length) {
+    return null;
+  }
+
+  if (periods.length === 1) {
+    return periods[0];
+  }
+
+  /*
+    Report_Number.Period is NVARCHAR(20).
+    Individual period values are stored in dbo.Report_Period.
+  */
+  const range = `${periods[0]} to ${periods[periods.length - 1]}`;
+
+  if (range.length <= 20) {
+    return range;
+  }
+
+  return `${periods.length} periods`;
+}
+
+function isPrivilegedInternalUser(user) {
+  const role = String(user?.role || "")
+    .toLowerCase()
+    .trim();
+
+  return (
+    String(user?.user_type || "").toLowerCase() === "internal" &&
+    ["admin", "accounting", "ssp_admins"].includes(role)
+  );
+}
+
+function getUserDisplayName(user) {
+  return (
+    user?.display_name ||
+    user?.fullName ||
+    user?.name ||
+    user?.username ||
+    user?.email ||
+    "System"
+  );
+}
+
 /* ============================================================================
    POST /api/uploads/register
+
+   Supports:
+   - Existing payload: period: "2026-07"
+   - New payload: periods: ["2026-04", "2026-05", "2026-06"]
+   - Locked-period validation
+   - Supplier-specific contract validation
+   - Report and Accrual upload types
 ============================================================================ */
+
 router.post("/register", requireAuth, async (req, res) => {
   try {
     let {
@@ -99,6 +193,7 @@ router.post("/register", requireAuth, async (req, res) => {
       report_type = "Sales",
       note = "",
       period = null,
+      periods = [],
       bp_code = null,
       contract_id = null,
       related_report_number = null,
@@ -107,15 +202,44 @@ router.post("/register", requireAuth, async (req, res) => {
     const user = req.user || {};
 
     if (!filename) {
-      return res.status(400).json({ error: "Missing filename" });
+      return res.status(400).json({
+        error: "Missing filename",
+      });
     }
 
     filename = String(filename).trim();
     report_type = String(report_type || "Sales").trim();
-    period = period ? String(period).trim() : null;
+    note = note ? String(note).trim() : "";
     bp_code = bp_code ? String(bp_code).trim() : null;
     contract_id = contract_id ? String(contract_id).trim() : null;
-    note = note ? String(note).trim() : "";
+
+    const normalizedPeriods = normalizePeriods(period, periods);
+
+    if (normalizedPeriods.length === 0) {
+      return res.status(400).json({
+        error: "At least one period is required",
+      });
+    }
+
+    const invalidPeriods = normalizedPeriods.filter(
+      (selectedPeriod) => !isValidPeriod(selectedPeriod),
+    );
+
+    if (invalidPeriods.length > 0) {
+      return res.status(400).json({
+        error: "Invalid period format",
+        details: `Use YYYY-MM format. Invalid period(s): ${invalidPeriods.join(
+          ", ",
+        )}`,
+      });
+    }
+
+    if (normalizedPeriods.length > 36) {
+      return res.status(400).json({
+        error: "Too many periods selected",
+        details: "A maximum of 36 periods can be selected for one report.",
+      });
+    }
 
     related_report_number =
       related_report_number !== null &&
@@ -124,19 +248,25 @@ router.post("/register", requireAuth, async (req, res) => {
         ? Number(related_report_number)
         : null;
 
-    const finalBpCode =
-      user.user_type === "bp" ? user.bp_code || bp_code || null : bp_code;
-
-    if (!period) {
+    if (
+      related_report_number !== null &&
+      (!Number.isSafeInteger(related_report_number) ||
+        related_report_number <= 0)
+    ) {
       return res.status(400).json({
-        error: "Period is required",
+        error: "Invalid related report number",
       });
     }
 
+    const finalBpCode =
+      String(user.user_type || "").toLowerCase() === "bp"
+        ? user.bp_code || bp_code || null
+        : bp_code;
+
     const uploadedBy =
-      user.user_type === "bp"
-        ? String(user.email || "")
-        : String(user.user_id || user.username || user.email || "");
+      String(user.user_type || "").toLowerCase() === "bp"
+        ? String(user.email || "").trim()
+        : String(user.user_id || user.username || user.email || "").trim();
 
     if (!uploadedBy) {
       return res.status(401).json({
@@ -144,20 +274,90 @@ router.post("/register", requireAuth, async (req, res) => {
       });
     }
 
-    const uploadedByName =
-      user.display_name ||
-      user.fullName ||
-      user.name ||
-      user.username ||
-      user.email ||
-      "System";
-
+    const uploadedByName = getUserDisplayName(user);
     const uploadedByType = user.user_type || "internal";
+    const periodSummary = buildPeriodSummary(normalizedPeriods);
+
+    /* ------------------------------------------------------------------------
+       Check locked periods
+    ------------------------------------------------------------------------ */
+
+    const lockedPeriodPlaceholders = normalizedPeriods.map(
+      (_, index) => `@p${index + 1}`,
+    );
+
+    const lockedPeriodSql = `
+      SELECT
+        Period AS period
+      FROM dbo.Accounting_Period
+      WHERE Is_Locked = 1
+        AND Period IN (${lockedPeriodPlaceholders.join(", ")});
+    `;
+
+    const { rows: lockedPeriods } = await query(
+      lockedPeriodSql,
+      normalizedPeriods,
+    );
+
+    if (lockedPeriods?.length > 0) {
+      return res.status(409).json({
+        error: "One or more selected periods are locked",
+        locked_periods: lockedPeriods.map((item) => item.period),
+      });
+    }
+
+    /* ------------------------------------------------------------------------
+       Check related report number
+    ------------------------------------------------------------------------ */
+
+    if (related_report_number !== null) {
+      const { rows: relatedReportRows } = await query(
+        `
+        SELECT TOP 1
+          Report_Number AS report_number
+        FROM dbo.Report_Number
+        WHERE Report_Number = @p1;
+        `,
+        [related_report_number],
+      );
+
+      if (!relatedReportRows?.length) {
+        return res.status(400).json({
+          error: "Related report number does not exist",
+        });
+      }
+    }
+
+    /* ------------------------------------------------------------------------
+       Validate supplier and contract combination
+    ------------------------------------------------------------------------ */
+
+    if (contract_id && finalBpCode) {
+      const { rows: contractRows } = await query(
+        `
+        SELECT TOP 1
+          Contract_ID AS contract_id,
+          BP_Code AS bp_code
+        FROM dbo.Ref_Contract
+        WHERE Contract_ID = @p1
+          AND BP_Code = @p2
+          AND Active_Flag = 1;
+        `,
+        [contract_id, finalBpCode],
+      );
+
+      if (!contractRows?.length) {
+        return res.status(400).json({
+          error: "Selected contract is not valid for the selected supplier",
+        });
+      }
+    }
 
     console.log("📥 Register Upload Payload:", {
       filename,
       report_type,
-      period,
+      period: periodSummary,
+      periods: normalizedPeriods,
       bp_code: finalBpCode,
       contract_id,
       related_report_number,
@@ -165,65 +365,157 @@ router.post("/register", requireAuth, async (req, res) => {
       uploadedBy,
     });
 
-    const sql = `
-      INSERT INTO dbo.Report_Number
-      (
-        Report_Type,
-        Filename,
-        Uploaded_By,
-        Uploaded_At_UTC,
-        Status,
-        Note,
-        Uploaded_By_Name,
-        Uploaded_By_Type,
-        Period,
-        BP_Code,
-        Contract_ID,
-        Related_Report_Number
-      )
-      OUTPUT
-        INSERTED.Report_Number AS report_number,
-        INSERTED.Report_Type AS report_type,
-        INSERTED.Filename AS filename,
-        INSERTED.Uploaded_By AS uploaded_by,
-        INSERTED.Uploaded_By_Name AS uploaded_by_name,
-        INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
-        INSERTED.Status AS status,
-        INSERTED.Uploaded_By_Type AS uploaded_by_type,
-        INSERTED.Period AS period,
-        INSERTED.BP_Code AS bp_code,
-        INSERTED.Contract_ID AS contract_id,
-        INSERTED.Related_Report_Number AS related_report_number
-      VALUES
-      (
-        @p1, @p2, @p3, GETUTCDATE(),
-        'new', @p4, @p5, @p6, @p7, @p8, @p9, @p10
-      );
-    `;
-
-    const params = [
+    /*
+      First 10 parameters are used for Report_Number.
+      The remaining parameters are used for Report_Period.
+    */
+    const fixedParams = [
       report_type,
       filename,
       uploadedBy,
       note,
       uploadedByName,
       uploadedByType,
-      period,
+      periodSummary,
       finalBpCode,
       contract_id,
       related_report_number,
     ];
 
+    const periodInsertValues = normalizedPeriods
+      .map((_, index) => `(@ReportNumber, @p${fixedParams.length + index + 1})`)
+      .join(",\n        ");
+
+    /*
+      Report_Number and Report_Period inserts run in one transaction.
+      This prevents a report header from being created without periods.
+    */
+    const sql = `
+      SET XACT_ABORT ON;
+      BEGIN TRANSACTION;
+
+      BEGIN TRY
+        DECLARE @InsertedReport TABLE
+        (
+          report_number BIGINT,
+          report_type NVARCHAR(50),
+          filename NVARCHAR(255),
+          uploaded_by NVARCHAR(MAX),
+          uploaded_by_name NVARCHAR(200),
+          uploaded_at_utc DATETIME2(7),
+          status NVARCHAR(50),
+          uploaded_by_type NVARCHAR(MAX),
+          period NVARCHAR(20),
+          bp_code NVARCHAR(50),
+          contract_id NVARCHAR(50),
+          related_report_number BIGINT
+        );
+
+        INSERT INTO dbo.Report_Number
+        (
+          Report_Type,
+          Filename,
+          Uploaded_By,
+          Uploaded_At_UTC,
+          Status,
+          Note,
+          Uploaded_By_Name,
+          Uploaded_By_Type,
+          Period,
+          BP_Code,
+          Contract_ID,
+          Related_Report_Number
+        )
+        OUTPUT
+          INSERTED.Report_Number,
+          INSERTED.Report_Type,
+          INSERTED.Filename,
+          INSERTED.Uploaded_By,
+          INSERTED.Uploaded_By_Name,
+          INSERTED.Uploaded_At_UTC,
+          INSERTED.Status,
+          INSERTED.Uploaded_By_Type,
+          INSERTED.Period,
+          INSERTED.BP_Code,
+          INSERTED.Contract_ID,
+          INSERTED.Related_Report_Number
+        INTO @InsertedReport
+        VALUES
+        (
+          @p1,
+          @p2,
+          @p3,
+          GETUTCDATE(),
+          'new',
+          @p4,
+          @p5,
+          @p6,
+          @p7,
+          @p8,
+          @p9,
+          @p10
+        );
+
+        DECLARE @ReportNumber BIGINT;
+
+        SELECT TOP 1
+          @ReportNumber = report_number
+        FROM @InsertedReport;
+
+        INSERT INTO dbo.Report_Period
+        (
+          Report_Number,
+          Period
+        )
+        VALUES
+          ${periodInsertValues};
+
+        COMMIT TRANSACTION;
+
+        SELECT
+          report_number,
+          report_type,
+          filename,
+          uploaded_by,
+          uploaded_by_name,
+          uploaded_at_utc,
+          status,
+          uploaded_by_type,
+          period,
+          bp_code,
+          contract_id,
+          related_report_number
+        FROM @InsertedReport;
+      END TRY
+      BEGIN CATCH
+        IF @@TRANCOUNT > 0
+        BEGIN
+          ROLLBACK TRANSACTION;
+        END;
+
+        THROW;
+      END CATCH;
+    `;
+
+    const params = [...fixedParams, ...normalizedPeriods];
+
     const { rows } = await query(sql, params);
     const inserted = rows?.[0];
 
-    console.log("✅ Upload registered:", inserted);
+    console.log("✅ Upload registered:", {
+      ...inserted,
+      periods: normalizedPeriods,
+    });
 
     return res.json({
       success: true,
-      data: inserted,
+      data: {
+        ...inserted,
+        periods: normalizedPeriods,
+      },
       report_number: inserted?.report_number,
       status: inserted?.status || "new",
+      periods: normalizedPeriods,
       message:
         "Upload registered successfully. Processing will continue through the backend workflow.",
     });
@@ -239,95 +531,195 @@ router.post("/register", requireAuth, async (req, res) => {
 
 /* ============================================================================
    GET /api/uploads/recent
-============================================================================ */
-/* ============================================================================
-   GET /api/uploads/recent
+
    Rules:
-   - BP: only their uploads
-   - Internal Admin/Accounting/SSP_Admins: all uploads
+   - Supplier user: only their uploads
+   - Admin, Accounting, SSP Admin: all uploads
    - Other internal users: only their uploads
 ============================================================================ */
+
+/* ============================================================================
+   GET /api/uploads/recent
+
+   Rules:
+   - Supplier user: only their uploads
+   - Admin, Accounting, SSP Admin: all uploads
+   - Other internal users: only their uploads
+
+   Supports:
+   - Existing single-period records
+   - New multi-period records from Report_Period
+   - Friendly display information
+   - No duplicate report rows
+============================================================================ */
+
 router.get("/recent", requireAuth, async (req, res) => {
   try {
     const url = safeParseUrl(req);
-    const reportType = url.searchParams.get("report_type");
-    const user = req.user;
+    const requestedReportType = url.searchParams.get("report_type");
 
-    const role = String(user.role || "")
-      .toLowerCase()
-      .trim();
-
-    // ✅ privileged internal users see ALL uploads
-    const isPrivilegedInternal =
-      user.user_type === "internal" &&
-      ["admin", "accounting", "ssp_admins"].includes(role);
-
-    let sql = `
-      SELECT TOP 20
-        Report_Number        AS report_number,
-        Report_Type          AS report_type,
-        Filename             AS filename,
-        Uploaded_By          AS uploaded_by,
-        ISNULL(Uploaded_By_Name, Uploaded_By) AS uploaded_by_name,
-        Uploaded_At_UTC      AS uploaded_at_utc,
-        Status               AS status,
-        Uploaded_By_Type     AS uploaded_by_type
-      FROM dbo.Report_Number
-    `;
+    const user = req.user || {};
+    const privilegedInternalUser = isPrivilegedInternalUser(user);
 
     const params = [];
+    const filters = [];
 
-    // ✅ Non-privileged users see ONLY their uploads
-    if (!isPrivilegedInternal) {
+    /*
+      Supplier and non-privileged internal users should see only
+      uploads belonging to them.
+    */
+    if (!privilegedInternalUser) {
       const uploadedByValue =
-        user.user_type === "bp"
+        String(user.user_type || "").toLowerCase() === "bp"
           ? String(user.email || "").trim()
           : String(user.user_id || user.username || user.email || "").trim();
 
       if (!uploadedByValue) {
-        return res.status(401).json({ error: "Missing user identity" });
+        return res.status(401).json({
+          error: "Missing user identity",
+        });
       }
 
-      sql += `
-        WHERE LOWER(Uploaded_By) = LOWER(@p1)
-      `;
       params.push(uploadedByValue);
+
+      filters.push(`LOWER(rn.Uploaded_By) = LOWER(@p${params.length})`);
     }
 
-    // Optional report_type filter
-    if (reportType) {
-      sql += params.length ? " AND" : " WHERE";
-      sql += ` Report_Type = @p${params.length + 1}`;
-      params.push(reportType);
+    if (requestedReportType) {
+      params.push(requestedReportType);
+
+      filters.push(`rn.Report_Type = @p${params.length}`);
     }
 
-    sql += " ORDER BY Uploaded_At_UTC DESC;";
+    const whereClause =
+      filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+
+    /*
+      OUTER APPLY aggregates all Report_Period rows into one value.
+      This prevents one recent-upload row from becoming multiple rows.
+
+      COALESCE falls back to Report_Number.Period for old records that
+      were created before Report_Period was introduced.
+    */
+    const sql = `
+      SELECT TOP 20
+        rn.Report_Number AS report_number,
+        rn.Report_Type AS report_type,
+        rn.Filename AS filename,
+        rn.Uploaded_By AS uploaded_by,
+
+        ISNULL(
+          rn.Uploaded_By_Name,
+          rn.Uploaded_By
+        ) AS uploaded_by_name,
+
+        rn.Uploaded_At_UTC AS uploaded_at_utc,
+        rn.Status AS status,
+        rn.Uploaded_By_Type AS uploaded_by_type,
+
+        rn.Period AS period,
+
+        COALESCE(
+          NULLIF(period_data.selected_periods, ''),
+          rn.Period
+        ) AS selected_periods,
+
+        ISNULL(
+          period_data.period_count,
+          CASE
+            WHEN rn.Period IS NULL OR LTRIM(RTRIM(rn.Period)) = ''
+              THEN 0
+            ELSE 1
+          END
+        ) AS period_count,
+
+        rn.BP_Code AS bp_code,
+        rn.Contract_ID AS contract_id,
+        rn.Related_Report_Number AS related_report_number
+
+      FROM dbo.Report_Number rn
+
+      OUTER APPLY
+      (
+        SELECT
+          STRING_AGG(
+            CAST(rp.Period AS NVARCHAR(MAX)),
+            ','
+          ) WITHIN GROUP
+          (
+            ORDER BY rp.Period
+          ) AS selected_periods,
+
+          COUNT(*) AS period_count
+
+        FROM dbo.Report_Period rp
+        WHERE rp.Report_Number = rn.Report_Number
+      ) period_data
+
+      ${whereClause}
+
+      ORDER BY rn.Uploaded_At_UTC DESC;
+    `;
 
     const { rows } = await query(sql, params);
 
-    // ✅ include download_key so frontend can use report_number for download
-    const items = (rows || []).map((r) => ({
-      ...r,
-      download_key: r.report_number,
-    }));
+    const items = (rows || []).map((item) => {
+      const periods = String(item.selected_periods || "")
+        .split(",")
+        .map((periodValue) => periodValue.trim())
+        .filter(Boolean);
 
-    res.json({ items });
+      /*
+        Backward-compatible fallback for records that have only
+        Report_Number.Period.
+      */
+      if (
+        periods.length === 0 &&
+        item.period &&
+        /^\d{4}-(0[1-9]|1[0-2])$/.test(String(item.period))
+      ) {
+        periods.push(String(item.period));
+      }
+
+      return {
+        ...item,
+        periods,
+        download_key: item.report_number,
+      };
+    });
+
+    return res.json({
+      items,
+    });
   } catch (err) {
     console.error("❌ /uploads/recent error:", err);
-    res.status(500).json({ error: "Failed to fetch uploads" });
+
+    return res.status(500).json({
+      error: "Failed to fetch uploads",
+      details: err.message,
+    });
   }
 });
 
 /* ============================================================================
    GET /api/uploads/download/:fileKey
-   - fileKey can be report_number (numeric) OR filename (string)
+
+   fileKey can be:
+   - Report number
+   - Filename
 ============================================================================ */
+
 router.get("/download/:fileKey", requireAuth, async (req, res) => {
   try {
     const rawKey = req.params.fileKey;
-    if (!rawKey) return res.status(400).json({ error: "Missing file key" });
 
-    const keyDecoded = (() => {
+    if (!rawKey) {
+      return res.status(400).json({
+        error: "Missing file key",
+      });
+    }
+
+    const decodedKey = (() => {
       try {
         return decodeURIComponent(rawKey).trim();
       } catch {
@@ -335,53 +727,59 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
       }
     })();
 
-    console.log("📥 [DOWNLOAD] request key:", keyDecoded);
+    console.log("📥 [DOWNLOAD] request key:", decodedKey);
 
-    // 1) If numeric -> treat as report_number and fetch filename from DB
-    let requestedFilename = keyDecoded;
+    let requestedFilename = decodedKey;
 
-    if (/^\d+$/.test(keyDecoded)) {
-      const reportNumber = Number(keyDecoded);
+    /*
+        When the key is numeric, treat it as Report_Number
+        and retrieve the filename from the database.
+      */
+    if (/^\d+$/.test(decodedKey)) {
+      const reportNumber = Number(decodedKey);
 
       const { rows } = await query(
         `
-        SELECT TOP 1 Filename
-        FROM dbo.Report_Number
-        WHERE Report_Number = @p1
-        ORDER BY Uploaded_At_UTC DESC;
-        `,
+          SELECT TOP 1
+            Filename
+          FROM dbo.Report_Number
+          WHERE Report_Number = @p1
+          ORDER BY Uploaded_At_UTC DESC;
+          `,
         [reportNumber],
       );
 
       if (!rows?.length) {
-        return res.status(404).json({ error: "Report not found" });
+        return res.status(404).json({
+          error: "Report not found",
+        });
       }
 
       requestedFilename = rows[0].Filename;
+
       console.log(
         "📥 [DOWNLOAD] report_number -> filename:",
         requestedFilename,
       );
     }
 
-    // 2) Find in Azure Blob (loose match)
-    const conn = process.env.AZURE_STORAGE_CONNECTION_STRING;
-    if (!conn) {
-      return res
-        .status(500)
-        .json({ error: "Azure storage connection missing" });
+    const connectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
+
+    if (!connectionString) {
+      return res.status(500).json({
+        error: "Azure storage connection missing",
+      });
     }
 
-    const blobServiceClient = BlobServiceClient.fromConnectionString(conn);
+    const blobServiceClient =
+      BlobServiceClient.fromConnectionString(connectionString);
 
-    // ✅ FIX: include dataintegration (your blob is here)
-    // Use env to control in each environment
     const containers = (
       process.env.AZURE_DOWNLOAD_CONTAINERS ||
       "dataintegration,ssp-reports,members,suppliers,internal"
     )
       .split(",")
-      .map((c) => c.trim())
+      .map((container) => container.trim())
       .filter(Boolean);
 
     const found = await findBlobByLooseName(
@@ -395,90 +793,371 @@ router.get("/download/:fileKey", requireAuth, async (req, res) => {
         normalized: normalizeName(requestedFilename),
         containers,
       });
-      return res.status(404).json({ error: "File not found" });
+
+      return res.status(404).json({
+        error: "File not found",
+      });
     }
 
     const { containerClient, blobName } = found;
+
     console.log("📥 [DOWNLOAD] matched blob:", {
       container: containerClient.containerName,
       blobName,
       blobNorm: normalizeName(blobName),
-      reqNorm: normalizeName(requestedFilename),
+      requestNorm: normalizeName(requestedFilename),
     });
 
     const blobClient = containerClient.getBlobClient(blobName);
+
     const download = await blobClient.download();
 
     const finalName = requestedFilename || blobName.split("/").pop();
 
     res.setHeader("Content-Disposition", `attachment; filename="${finalName}"`);
+
     res.setHeader("Content-Type", getContentTypeByExt(finalName));
 
     download.readableStreamBody.pipe(res);
   } catch (err) {
     console.error("❌ /uploads/download error:", err);
-    res.status(500).json({ error: "Failed to download file" });
+
+    return res.status(500).json({
+      error: "Failed to download file",
+    });
   }
 });
 
 /* ============================================================================
    GET /api/uploads/lookups/suppliers?q=
+
+   Note:
+   The current database has BP_Code, but no Supplier Name column.
+   The endpoint still returns display_name for future compatibility.
 ============================================================================ */
+
 router.get("/lookups/suppliers", requireAuth, async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
+    const searchText = String(req.query.q || "").trim();
 
-    if (q.length < 1) {
-      return res.json({ items: [] });
+    if (searchText.length < 1) {
+      return res.json({
+        items: [],
+      });
     }
 
     const { rows } = await query(
       `
-      SELECT TOP 20
-        BP_Code AS bp_code
-      FROM dbo.Ref_Contract
-      WHERE BP_Code LIKE @p1
-      GROUP BY BP_Code
-      ORDER BY BP_Code;
-      `,
-      [`%${q}%`],
+        SELECT TOP 20
+          BP_Code AS bp_code,
+          BP_Code AS display_name
+        FROM dbo.Ref_Contract
+        WHERE BP_Code LIKE @p1
+        GROUP BY BP_Code
+        ORDER BY BP_Code;
+        `,
+      [`%${searchText}%`],
     );
 
-    res.json({ items: rows || [] });
+    return res.json({
+      items: rows || [],
+    });
   } catch (err) {
     console.error("❌ supplier lookup error:", err);
-    res.status(500).json({ error: "Failed to search suppliers" });
+
+    return res.status(500).json({
+      error: "Failed to search suppliers",
+    });
   }
 });
 
 /* ============================================================================
-   GET /api/uploads/lookups/contracts?q=
+   GET /api/uploads/lookups/contracts?q=&bp_code=
+
+   Supports:
+   - Existing contract ID search
+   - Supplier-specific contract filtering
+   - Default newest active contract
 ============================================================================ */
+
 router.get("/lookups/contracts", requireAuth, async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
+    const searchText = String(req.query.q || "").trim();
 
-    if (q.length < 1) {
-      return res.json({ items: [] });
+    const bpCode = String(req.query.bp_code || "").trim();
+
+    if (searchText.length < 1 && bpCode.length < 1) {
+      return res.json({
+        items: [],
+        default_contract_id: null,
+      });
     }
+
+    const conditions = ["Active_Flag = 1"];
+
+    const params = [];
+
+    if (bpCode) {
+      params.push(bpCode);
+
+      conditions.push(`BP_Code = @p${params.length}`);
+    }
+
+    if (searchText) {
+      params.push(`%${searchText}%`);
+
+      conditions.push(
+        `CAST(Contract_ID AS NVARCHAR(255)) LIKE @p${params.length}`,
+      );
+    }
+
+    const sql = `
+        SELECT TOP 50
+          Contract_ID AS contract_id,
+          CAST(
+            Contract_ID AS NVARCHAR(255)
+          ) AS contract_name,
+          BP_Code AS bp_code,
+          Status AS status,
+          Effective_From AS effective_from,
+          Effective_To AS effective_to,
+          Active_Flag AS active_flag
+        FROM dbo.Ref_Contract
+        WHERE ${conditions.join("\n          AND ")}
+        ORDER BY
+          Effective_From DESC,
+          Effective_To DESC,
+          Contract_ID DESC;
+      `;
+
+    const { rows } = await query(sql, params);
+
+    const items = (rows || []).map((item, index) => ({
+      ...item,
+      is_default: index === 0,
+    }));
+
+    return res.json({
+      items,
+      default_contract_id: items[0]?.contract_id || null,
+    });
+  } catch (err) {
+    console.error("❌ contract lookup error:", err);
+
+    return res.status(500).json({
+      error: "Failed to search contracts",
+    });
+  }
+});
+
+/* ============================================================================
+   GET /api/uploads/periods
+
+   Returns accounting periods and lock status.
+============================================================================ */
+
+router.get("/periods", requireAuth, async (_req, res) => {
+  try {
+    const { rows } = await query(
+      `
+        SELECT
+          Period AS period,
+          Is_Locked AS is_locked,
+          Locked_By AS locked_by,
+          Locked_At_UTC AS locked_at_utc,
+          Unlocked_By AS unlocked_by,
+          Unlocked_At_UTC AS unlocked_at_utc,
+          Created_At_UTC AS created_at_utc,
+          Updated_At_UTC AS updated_at_utc
+        FROM dbo.Accounting_Period
+        ORDER BY Period DESC;
+        `,
+      [],
+    );
+
+    return res.json({
+      items: rows || [],
+    });
+  } catch (err) {
+    console.error("❌ periods lookup error:", err);
+
+    return res.status(500).json({
+      error: "Failed to fetch accounting periods",
+    });
+  }
+});
+
+/* ============================================================================
+   PUT /api/uploads/periods/:period/lock
+
+   Admin, Accounting, and SSP Admin only.
+============================================================================ */
+
+router.put("/periods/:period/lock", requireAuth, async (req, res) => {
+  try {
+    const user = req.user || {};
+    const period = String(req.params.period || "").trim();
+
+    if (!isPrivilegedInternalUser(user)) {
+      return res.status(403).json({
+        error: "Only authorized internal users can lock accounting periods",
+      });
+    }
+
+    if (!isValidPeriod(period)) {
+      return res.status(400).json({
+        error: "Invalid period format. Use YYYY-MM.",
+      });
+    }
+
+    const changedBy = getUserDisplayName(user);
 
     const { rows } = await query(
       `
-      SELECT TOP 20
-        Contract_ID AS contract_id,
-        CAST(Contract_ID AS NVARCHAR(255)) AS contract_name
-      FROM dbo.Ref_Contract
-      WHERE CAST(Contract_ID AS NVARCHAR(255)) LIKE @p1
-      GROUP BY Contract_ID
-      ORDER BY Contract_ID;
-      `,
-      [`%${q}%`],
+        MERGE dbo.Accounting_Period AS target
+        USING
+        (
+          SELECT
+            @p1 AS Period
+        ) AS source
+          ON target.Period = source.Period
+
+        WHEN MATCHED THEN
+          UPDATE SET
+            Is_Locked = 1,
+            Locked_By = @p2,
+            Locked_At_UTC = SYSUTCDATETIME(),
+            Unlocked_By = NULL,
+            Unlocked_At_UTC = NULL,
+            Updated_At_UTC = SYSUTCDATETIME()
+
+        WHEN NOT MATCHED THEN
+          INSERT
+          (
+            Period,
+            Is_Locked,
+            Locked_By,
+            Locked_At_UTC,
+            Created_At_UTC,
+            Updated_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            1,
+            @p2,
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME()
+          )
+
+        OUTPUT
+          INSERTED.Period AS period,
+          INSERTED.Is_Locked AS is_locked,
+          INSERTED.Locked_By AS locked_by,
+          INSERTED.Locked_At_UTC AS locked_at_utc,
+          INSERTED.Updated_At_UTC AS updated_at_utc;
+        `,
+      [period, changedBy],
     );
 
-    res.json({ items: rows || [] });
+    return res.json({
+      success: true,
+      data: rows?.[0],
+      message: `Period ${period} was locked successfully.`,
+    });
   } catch (err) {
-    console.error("❌ contract lookup error:", err);
-    res.status(500).json({ error: "Failed to search contracts" });
+    console.error("❌ period lock error:", err);
+
+    return res.status(500).json({
+      error: "Failed to lock accounting period",
+    });
+  }
+});
+
+/* ============================================================================
+   PUT /api/uploads/periods/:period/unlock
+
+   Admin, Accounting, and SSP Admin only.
+============================================================================ */
+
+router.put("/periods/:period/unlock", requireAuth, async (req, res) => {
+  try {
+    const user = req.user || {};
+    const period = String(req.params.period || "").trim();
+
+    if (!isPrivilegedInternalUser(user)) {
+      return res.status(403).json({
+        error: "Only authorized internal users can unlock accounting periods",
+      });
+    }
+
+    if (!isValidPeriod(period)) {
+      return res.status(400).json({
+        error: "Invalid period format. Use YYYY-MM.",
+      });
+    }
+
+    const changedBy = getUserDisplayName(user);
+
+    const { rows } = await query(
+      `
+        MERGE dbo.Accounting_Period AS target
+        USING
+        (
+          SELECT
+            @p1 AS Period
+        ) AS source
+          ON target.Period = source.Period
+
+        WHEN MATCHED THEN
+          UPDATE SET
+            Is_Locked = 0,
+            Unlocked_By = @p2,
+            Unlocked_At_UTC = SYSUTCDATETIME(),
+            Updated_At_UTC = SYSUTCDATETIME()
+
+        WHEN NOT MATCHED THEN
+          INSERT
+          (
+            Period,
+            Is_Locked,
+            Unlocked_By,
+            Unlocked_At_UTC,
+            Created_At_UTC,
+            Updated_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            0,
+            @p2,
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME(),
+            SYSUTCDATETIME()
+          )
+
+        OUTPUT
+          INSERTED.Period AS period,
+          INSERTED.Is_Locked AS is_locked,
+          INSERTED.Unlocked_By AS unlocked_by,
+          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
+          INSERTED.Updated_At_UTC AS updated_at_utc;
+        `,
+      [period, changedBy],
+    );
+
+    return res.json({
+      success: true,
+      data: rows?.[0],
+      message: `Period ${period} was unlocked successfully.`,
+    });
+  } catch (err) {
+    console.error("❌ period unlock error:", err);
+
+    return res.status(500).json({
+      error: "Failed to unlock accounting period",
+    });
   }
 });
 

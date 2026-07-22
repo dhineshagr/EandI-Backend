@@ -15,21 +15,58 @@ const asInt = (v, d = 0) => {
 /* ======================================================================
    REGISTER REPORT (Metadata only)
 ====================================================================== */
+/* ======================================================================
+   REGISTER REPORT (Metadata only)
+   - Supports legacy single period
+   - Supports multiple periods
+   - Stores a summary value in Report_Number.Period
+   - Stores one row per period in Report_Period
+====================================================================== */
 router.post("/reports/register", requireAuth, async (req, res, next) => {
   try {
     const {
       filename,
-      report_type = "Sales",
+      report_type = "Members",
       note = "",
       period = null,
+      periods = [],
       bp_code = null,
       contract_id = null,
       related_report_number = null,
     } = req.body || {};
 
     if (!filename) {
-      return res.status(400).json({ error: "filename is required" });
+      return res.status(400).json({
+        error: "filename is required",
+      });
     }
+
+    /*
+     * Normalize periods.
+     *
+     * New request:
+     * periods: ["2026-04", "2026-05"]
+     *
+     * Legacy request:
+     * period: "2026-04"
+     */
+    const normalizedPeriods = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(periods) ? periods : []),
+          ...(period ? [period] : []),
+        ]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean),
+      ),
+    );
+
+    /*
+     * Keep Report_Number.Period for backward compatibility.
+     * For multiple periods, store a comma-separated summary.
+     */
+    const periodSummary =
+      normalizedPeriods.length > 0 ? normalizedPeriods.join(", ") : null;
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
@@ -41,65 +78,152 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
 
     const uploaded_by_type = req.user?.user_type || "internal";
 
-    const sql = `
-      INSERT INTO report_number
-        (
-          filename,
-          report_type,
-          uploaded_by,
-          uploaded_by_name,
-          uploaded_by_type,
-          period,
-          bp_code,
-          contract_id,
-          related_report_number,
-          uploaded_at_utc,
-          status,
-          note,
-          created_at_utc,
-          updated_at_utc
-        )
-      OUTPUT INSERTED.*
+    const reportInsertSql = `
+      INSERT INTO dbo.Report_Number
+      (
+        FileName,
+        Report_Type,
+        Uploaded_By,
+        Uploaded_By_Name,
+        Uploaded_By_Type,
+        Period,
+        BP_Code,
+        Contract_ID,
+        Related_Report_Number,
+        Uploaded_At_UTC,
+        Status,
+        Note,
+        Created_At_UTC,
+        Updated_At_UTC
+      )
+      OUTPUT
+        INSERTED.Report_Number AS report_number,
+        INSERTED.FileName AS filename,
+        INSERTED.Report_Type AS report_type,
+        INSERTED.Period AS period,
+        INSERTED.BP_Code AS bp_code,
+        INSERTED.Contract_ID AS contract_id,
+        INSERTED.Related_Report_Number AS related_report_number,
+        INSERTED.Uploaded_By AS uploaded_by,
+        INSERTED.Uploaded_By_Name AS uploaded_by_name,
+        INSERTED.Uploaded_By_Type AS uploaded_by_type,
+        INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
+        INSERTED.Status AS status,
+        INSERTED.Note AS note
       VALUES
-        (
-          @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
-          GETUTCDATE(), 'new', @p10, GETUTCDATE(), GETUTCDATE()
-        );
+      (
+        @p1,
+        @p2,
+        @p3,
+        @p4,
+        @p5,
+        @p6,
+        @p7,
+        @p8,
+        @p9,
+        GETUTCDATE(),
+        'new',
+        @p10,
+        GETUTCDATE(),
+        GETUTCDATE()
+      );
     `;
 
-    const { rows } = await query(sql, [
+    const { rows: reportRows } = await query(reportInsertSql, [
       filename,
       report_type,
       uploaded_by,
       uploaded_by_name,
       uploaded_by_type,
-      period,
-      bp_code,
-      contract_id,
-      related_report_number,
-      note,
+      periodSummary,
+      bp_code || null,
+      contract_id || null,
+      related_report_number || null,
+      note || "",
     ]);
 
+    const report = reportRows?.[0];
+    const reportNumber = report?.report_number;
+
+    if (!reportNumber) {
+      return res.status(500).json({
+        error: "Failed to register report",
+      });
+    }
+
+    /*
+     * Insert one row per selected accounting period.
+     */
+    for (const selectedPeriod of normalizedPeriods) {
+      await query(
+        `
+        INSERT INTO dbo.Report_Period
+        (
+          Report_Number,
+          Period,
+          Created_At_UTC,
+          Updated_At_UTC
+        )
+        VALUES
+        (
+          @p1,
+          @p2,
+          GETUTCDATE(),
+          GETUTCDATE()
+        );
+        `,
+        [reportNumber, selectedPeriod],
+      );
+    }
+
+    /*
+     * Audit logging should not fail the report registration.
+     */
     try {
       await query(
-        `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
-         VALUES (@p1,'register_report',@p2,GETUTCDATE());`,
+        `
+        INSERT INTO dbo.Users_Audit_Log
+        (
+          User_Email,
+          Action,
+          Context_JSON,
+          Created_At_UTC
+        )
+        VALUES
+        (
+          @p1,
+          'register_report',
+          @p2,
+          GETUTCDATE()
+        );
+        `,
         [
           uploaded_by,
           JSON.stringify({
+            report_number: reportNumber,
             filename,
             report_type,
             note,
-            period,
-            bp_code,
-            contract_id,
-            related_report_number,
+            period: periodSummary,
+            periods: normalizedPeriods,
+            bp_code: bp_code || null,
+            contract_id: contract_id || null,
+            related_report_number: related_report_number || null,
           }),
         ],
       );
-    } catch {}
+    } catch (auditErr) {
+      console.warn("Register report audit log skipped:", auditErr.message);
+    }
 
-    res.json({ report: rows[0] });
+    res.json({
+      ok: true,
+      report: {
+        ...report,
+        period: periodSummary,
+        periods: normalizedPeriods,
+      },
+    });
   } catch (err) {
     console.error("❌ POST /reports/register error:", err);
     next(err);
@@ -109,76 +233,217 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
 /* ======================================================================
    LIST REPORTS (Dashboard)
 ====================================================================== */
+/* ======================================================================
+   LIST REPORTS (Dashboard)
+   - Supports legacy single period
+   - Supports multiple periods from Report_Period
+   - Returns both period and periods[]
+   - Prevents Report_Period from multiplying detail-row totals
+====================================================================== */
 router.get("/reports/list", requireAuth, async (_req, res, next) => {
   try {
     const sql = `
       SELECT
-        r.report_number,
-        r.filename,
-        r.report_type,
-        r.period,
-        r.bp_code,
-        r.contract_id,
-        r.related_report_number,
+        r.Report_Number AS report_number,
+        r.FileName AS filename,
+        r.Report_Type AS report_type,
 
-        -- keep original values (for debugging / exports)
-        r.uploaded_by,
-        r.uploaded_at_utc,
+        COALESCE(
+          NULLIF(period_data.selected_periods, ''),
+          NULLIF(r.Period, '')
+        ) AS period,
 
-        -- ✅ preferred display value for UI
-        COALESCE(NULLIF(r.uploaded_by_name, ''), NULLIF(r.uploaded_by, ''), 'System') AS uploaded_by_display,
-        r.uploaded_by_name,
-        r.uploaded_by_type,
+        r.BP_Code AS bp_code,
+        r.Contract_ID AS contract_id,
+        r.Related_Report_Number AS related_report_number,
 
-        COUNT(d.cur_detail_id) AS total_rows,
-        SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) AS passed_count,
-        SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-        SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
-        SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) AS validated_count,
+        r.Uploaded_By AS uploaded_by,
+        r.Uploaded_At_UTC AS uploaded_at_utc,
+
+        COALESCE(
+          NULLIF(r.Uploaded_By_Name, ''),
+          NULLIF(r.Uploaded_By, ''),
+          'System'
+        ) AS uploaded_by_display,
+
+        r.Uploaded_By_Name AS uploaded_by_name,
+        r.Uploaded_By_Type AS uploaded_by_type,
+
+        COUNT(d.Cur_Detail_ID) AS total_rows,
+
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+              THEN 1
+            ELSE 0
+          END
+        ) AS passed_count,
+
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+              THEN 1
+            ELSE 0
+          END
+        ) AS failed_count,
+
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+              THEN 1
+            ELSE 0
+          END
+        ) AS approved_count,
+
+        SUM(
+          CASE
+            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
+              THEN 1
+            ELSE 0
+          END
+        ) AS validated_count,
 
         CASE
-          -- ✅ ZERO SALES: treat as submitted/approved (no detail rows expected)
-          WHEN UPPER(LTRIM(RTRIM(r.filename))) = 'ZERO_SALES'
-            OR UPPER(LTRIM(RTRIM(r.filename))) LIKE 'ZERO_SALES%' THEN 'submitted'
+          /*
+           * Zero Sales reports do not have detail rows.
+           */
+          WHEN UPPER(LTRIM(RTRIM(r.FileName))) = 'ZERO_SALES'
+            OR UPPER(LTRIM(RTRIM(r.FileName))) LIKE 'ZERO_SALES%'
+            THEN 'submitted'
 
-          -- Any failed row => Failed
-          WHEN SUM(CASE WHEN d.dq_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
+          /*
+           * Prefer explicit approved status from Report_Number.
+           */
+          WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) = 'approved'
+            THEN 'approved'
 
-          -- All rows approved => Approved
-          WHEN COUNT(d.cur_detail_id) > 0
-           AND SUM(CASE WHEN d.dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'approved'
+          /*
+           * Any failed row means the report failed.
+           */
+          WHEN SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                THEN 1
+              ELSE 0
+            END
+          ) > 0
+            THEN 'failed'
 
-          -- ✅ All rows passed => Passed
-          WHEN COUNT(d.cur_detail_id) > 0
-           AND SUM(CASE WHEN d.dq_status = 'passed' THEN 1 ELSE 0 END) = COUNT(d.cur_detail_id) THEN 'passed'
+          /*
+           * All detail rows approved.
+           */
+          WHEN COUNT(d.Cur_Detail_ID) > 0
+            AND SUM(
+              CASE
+                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                  THEN 1
+                ELSE 0
+              END
+            ) = COUNT(d.Cur_Detail_ID)
+            THEN 'approved'
 
-          -- Any validated => Validated (only if not failed/approved/passed)
-          WHEN SUM(CASE WHEN d.dq_status = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'validated'
+          /*
+           * All detail rows passed.
+           */
+          WHEN COUNT(d.Cur_Detail_ID) > 0
+            AND SUM(
+              CASE
+                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+                  THEN 1
+                ELSE 0
+              END
+            ) = COUNT(d.Cur_Detail_ID)
+            THEN 'passed'
 
-          -- ✅ No detail rows yet => Pending
+          /*
+           * At least one validated row.
+           */
+          WHEN SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
+                THEN 1
+              ELSE 0
+            END
+          ) > 0
+            THEN 'validated'
+
+          /*
+           * Preserve current Report_Number status when available.
+           */
+          WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) IN
+            ('new', 'staged', 'submitted', 'pending', 'processing')
+            THEN LOWER(r.Status)
+
+          /*
+           * No detail rows yet.
+           */
           ELSE 'pending'
         END AS status
 
-      FROM report_number r
-      LEFT JOIN cur_invoice_detail d
-        ON d.report_number = r.report_number
+      FROM dbo.Report_Number r
+
+      LEFT JOIN dbo.Cur_Invoice_Detail d
+        ON d.Report_Number = r.Report_Number
+
+      /*
+       * Aggregate periods before joining to detail records.
+       * This prevents duplicate detail counts and dollar totals.
+       */
+      OUTER APPLY (
+        SELECT
+          STRING_AGG(
+            CAST(period_rows.Period AS NVARCHAR(50)),
+            ', '
+          ) AS selected_periods
+        FROM (
+          SELECT DISTINCT rp.Period
+          FROM dbo.Report_Period rp
+          WHERE rp.Report_Number = r.Report_Number
+            AND rp.Period IS NOT NULL
+            AND LTRIM(RTRIM(CAST(rp.Period AS NVARCHAR(50)))) <> ''
+        ) period_rows
+      ) period_data
+
       GROUP BY
-        r.report_number,
-        r.filename,
-        r.report_type,
-        r.period,
-        r.bp_code,
-        r.contract_id,
-        r.related_report_number,
-        r.uploaded_by,
-        r.uploaded_by_name,
-        r.uploaded_by_type,
-        r.uploaded_at_utc
-      ORDER BY r.uploaded_at_utc DESC;
+        r.Report_Number,
+        r.FileName,
+        r.Report_Type,
+        r.Period,
+        period_data.selected_periods,
+        r.BP_Code,
+        r.Contract_ID,
+        r.Related_Report_Number,
+        r.Uploaded_By,
+        r.Uploaded_By_Name,
+        r.Uploaded_By_Type,
+        r.Uploaded_At_UTC,
+        r.Status
+
+      ORDER BY r.Uploaded_At_UTC DESC;
     `;
 
     const { rows } = await query(sql);
-    res.json({ reports: rows });
+
+    /*
+     * Return both:
+     * period  = "2026-04, 2026-05"
+     * periods = ["2026-04", "2026-05"]
+     */
+    const reports = rows.map((report) => {
+      const periods = String(report.period || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      return {
+        ...report,
+        periods,
+      };
+    });
+
+    res.json({
+      reports,
+    });
   } catch (err) {
     console.error("❌ GET /reports/list error:", err);
     next(err);
@@ -188,41 +453,249 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
 /* ======================================================================
    REPORT SUMMARY
 ====================================================================== */
+/* ======================================================================
+   REPORT SUMMARY
+   - Returns report header metadata
+   - Returns DQ counts
+   - Supports multiple periods
+   - Supports legacy Report_Number.Period fallback
+   - Supports Zero Sales reports with no detail rows
+====================================================================== */
 router.get(
   "/reports/:reportNumber/summary",
   requireAuth,
   async (req, res, next) => {
     try {
       const rn = asInt(req.params.reportNumber);
-      if (!rn) return res.status(400).json({ error: "Invalid report number" });
+
+      if (!rn) {
+        return res.status(400).json({
+          error: "Invalid report number",
+        });
+      }
 
       const sql = `
-      SELECT
-        report_number,
-        COUNT(*) AS total_rows,
-        SUM(CASE WHEN dq_status = 'passed' THEN 1 ELSE 0 END) AS passed_count,
-        SUM(CASE WHEN dq_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-        SUM(CASE WHEN dq_status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
-        SUM(CASE WHEN dq_status = 'validated' THEN 1 ELSE 0 END) AS validated_count,
-        CASE
-          WHEN SUM(CASE WHEN dq_status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'Failed'
-          WHEN SUM(CASE WHEN dq_status = 'approved' THEN 1 ELSE 0 END) = COUNT(*) THEN 'Approved'
-          WHEN SUM(CASE WHEN dq_status = 'passed' THEN 1 ELSE 0 END) > 0 THEN 'Passed'
-          WHEN SUM(CASE WHEN dq_status = 'validated' THEN 1 ELSE 0 END) > 0 THEN 'Validated'
-          ELSE 'In Progress'
-        END AS report_status
-      FROM cur_invoice_detail
-      WHERE report_number=@p1
-      GROUP BY report_number;
-    `;
+        SELECT
+          r.Report_Number AS report_number,
+          r.FileName AS filename,
+          r.Report_Type AS report_type,
+
+          COALESCE(
+            NULLIF(period_data.selected_periods, ''),
+            NULLIF(r.Period, '')
+          ) AS period,
+
+          r.BP_Code AS bp_code,
+          r.Contract_ID AS contract_id,
+          r.Related_Report_Number AS related_report_number,
+
+          r.Uploaded_By AS uploaded_by,
+          r.Uploaded_By_Name AS uploaded_by_name,
+          r.Uploaded_By_Type AS uploaded_by_type,
+          r.Uploaded_At_UTC AS uploaded_at_utc,
+
+          COALESCE(
+            NULLIF(r.Uploaded_By_Name, ''),
+            NULLIF(r.Uploaded_By, ''),
+            'System'
+          ) AS uploaded_by_display,
+
+          COUNT(d.Cur_Detail_ID) AS total_rows,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+                THEN 1
+              ELSE 0
+            END
+          ) AS passed_count,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                THEN 1
+              ELSE 0
+            END
+          ) AS failed_count,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                THEN 1
+              ELSE 0
+            END
+          ) AS approved_count,
+
+          SUM(
+            CASE
+              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
+                THEN 1
+              ELSE 0
+            END
+          ) AS validated_count,
+
+          CASE
+            /*
+             * Zero Sales reports do not contain detail rows.
+             */
+            WHEN UPPER(LTRIM(RTRIM(r.FileName))) = 'ZERO_SALES'
+              OR UPPER(LTRIM(RTRIM(r.FileName))) LIKE 'ZERO_SALES%'
+              THEN 'submitted'
+
+            /*
+             * Prefer the explicit approved header status.
+             */
+            WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) = 'approved'
+              THEN 'approved'
+
+            /*
+             * Any failed detail row means the report failed.
+             */
+            WHEN SUM(
+              CASE
+                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                  THEN 1
+                ELSE 0
+              END
+            ) > 0
+              THEN 'failed'
+
+            /*
+             * Every detail row approved.
+             */
+            WHEN COUNT(d.Cur_Detail_ID) > 0
+              AND SUM(
+                CASE
+                  WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                    THEN 1
+                  ELSE 0
+                END
+              ) = COUNT(d.Cur_Detail_ID)
+              THEN 'approved'
+
+            /*
+             * Every detail row passed.
+             */
+            WHEN COUNT(d.Cur_Detail_ID) > 0
+              AND SUM(
+                CASE
+                  WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+                    THEN 1
+                  ELSE 0
+                END
+              ) = COUNT(d.Cur_Detail_ID)
+              THEN 'passed'
+
+            /*
+             * At least one detail row validated.
+             */
+            WHEN SUM(
+              CASE
+                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
+                  THEN 1
+                ELSE 0
+              END
+            ) > 0
+              THEN 'validated'
+
+            /*
+             * Preserve an existing processing status.
+             */
+            WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) IN
+              ('new', 'staged', 'submitted', 'pending', 'processing')
+              THEN LOWER(r.Status)
+
+            ELSE 'pending'
+          END AS report_status
+
+        FROM dbo.Report_Number r
+
+        LEFT JOIN dbo.Cur_Invoice_Detail d
+          ON d.Report_Number = r.Report_Number
+
+        OUTER APPLY (
+          SELECT
+            STRING_AGG(
+              CAST(period_rows.Period AS NVARCHAR(50)),
+              ', '
+            ) AS selected_periods
+          FROM (
+            SELECT DISTINCT rp.Period
+            FROM dbo.Report_Period rp
+            WHERE rp.Report_Number = r.Report_Number
+              AND rp.Period IS NOT NULL
+              AND LTRIM(
+                RTRIM(
+                  CAST(rp.Period AS NVARCHAR(50))
+                )
+              ) <> ''
+          ) period_rows
+        ) period_data
+
+        WHERE r.Report_Number = @p1
+
+        GROUP BY
+          r.Report_Number,
+          r.FileName,
+          r.Report_Type,
+          r.Period,
+          period_data.selected_periods,
+          r.BP_Code,
+          r.Contract_ID,
+          r.Related_Report_Number,
+          r.Uploaded_By,
+          r.Uploaded_By_Name,
+          r.Uploaded_By_Type,
+          r.Uploaded_At_UTC,
+          r.Status;
+      `;
 
       const { rows } = await query(sql, [rn]);
-      if (!rows.length)
-        return res.status(404).json({ error: "Report not found" });
 
-      res.json({ report: rows[0], counts: rows[0] });
+      if (!rows.length) {
+        return res.status(404).json({
+          error: "Report not found",
+        });
+      }
+
+      const row = rows[0];
+
+      const periods = String(row.period || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+      const report = {
+        report_number: row.report_number,
+        filename: row.filename,
+        report_type: row.report_type,
+        period: row.period || null,
+        periods,
+        bp_code: row.bp_code || null,
+        contract_id: row.contract_id || null,
+        related_report_number: row.related_report_number || null,
+        uploaded_by: row.uploaded_by || null,
+        uploaded_by_name: row.uploaded_by_name || null,
+        uploaded_by_type: row.uploaded_by_type || null,
+        uploaded_by_display: row.uploaded_by_display || "System",
+        uploaded_at_utc: row.uploaded_at_utc || null,
+        report_status: row.report_status,
+      };
+
+      const counts = {
+        total_rows: Number(row.total_rows || 0),
+        passed_count: Number(row.passed_count || 0),
+        failed_count: Number(row.failed_count || 0),
+        approved_count: Number(row.approved_count || 0),
+        validated_count: Number(row.validated_count || 0),
+      };
+
+      res.json({
+        report,
+        counts,
+      });
     } catch (err) {
-      console.error("❌ GET summary error:", err);
+      console.error("❌ GET /reports/:reportNumber/summary error:", err);
       next(err);
     }
   },
@@ -611,11 +1084,21 @@ router.get(
   },
 );
 
+/* ======================================================================
+   MANUAL CREATE REPORT
+   - Supports Accrual and Return
+   - Supports legacy period
+   - Supports multiple periods
+   - Stores summary in Report_Number.Period
+   - Stores one row per period in Report_Period
+   - Stages detail rows for Informatica processing
+====================================================================== */
 router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
   try {
     const {
       report_type,
       period = null,
+      periods = [],
       bp_code = null,
       contract_id = null,
       related_report_number = null,
@@ -633,8 +1116,30 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       });
     }
 
-    if (!period) {
-      return res.status(400).json({ error: "period is required" });
+    /*
+     * Support both:
+     *
+     * Legacy:
+     * period: "2026-04"
+     *
+     * New:
+     * periods: ["2026-04", "2026-05"]
+     */
+    const normalizedPeriods = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(periods) ? periods : []),
+          ...(period ? [period] : []),
+        ]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean),
+      ),
+    );
+
+    if (normalizedPeriods.length === 0) {
+      return res.status(400).json({
+        error: "At least one period is required",
+      });
     }
 
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -642,6 +1147,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         error: "At least one detail row is required",
       });
     }
+
+    /*
+     * Keep Report_Number.Period populated for backward compatibility.
+     */
+    const periodSummary = normalizedPeriods.join(", ");
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
@@ -653,6 +1163,10 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
     const uploaded_by_type = req.user?.user_type || "internal";
 
+    /*
+     * BP users must use their assigned BP code.
+     * Internal users may use the submitted BP code.
+     */
     const finalBpCode =
       req.user?.user_type === "bp"
         ? req.user?.bp_code || bp_code || null
@@ -661,6 +1175,9 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     const manualFileName =
       report_type === "Accrual" ? "MANUAL_ACCRUAL" : "MANUAL_RETURN";
 
+    /* ==================================================================
+       CREATE REPORT HEADER
+    ================================================================== */
     const reportInsertSql = `
       INSERT INTO dbo.Report_Number
       (
@@ -672,7 +1189,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         Period,
         BP_Code,
         Contract_ID,
-        related_report_number,
+        Related_Report_Number,
         Uploaded_At_UTC,
         Status,
         Note,
@@ -686,12 +1203,28 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         INSERTED.Period AS period,
         INSERTED.BP_Code AS bp_code,
         INSERTED.Contract_ID AS contract_id,
-        INSERTED.related_report_number AS related_report_number,
+        INSERTED.Related_Report_Number AS related_report_number,
+        INSERTED.Uploaded_By AS uploaded_by,
+        INSERTED.Uploaded_By_Name AS uploaded_by_name,
+        INSERTED.Uploaded_By_Type AS uploaded_by_type,
+        INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
         INSERTED.Status AS status
       VALUES
       (
-        @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9,
-        GETUTCDATE(), 'submitted', @p10, GETUTCDATE(), GETUTCDATE()
+        @p1,
+        @p2,
+        @p3,
+        @p4,
+        @p5,
+        @p6,
+        @p7,
+        @p8,
+        @p9,
+        GETUTCDATE(),
+        'submitted',
+        @p10,
+        GETUTCDATE(),
+        GETUTCDATE()
       );
     `;
 
@@ -701,7 +1234,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       uploaded_by,
       uploaded_by_name,
       uploaded_by_type,
-      period,
+      periodSummary,
       finalBpCode,
       contract_id || null,
       related_report_number || null,
@@ -717,6 +1250,34 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       });
     }
 
+    /* ==================================================================
+       STORE SELECTED PERIODS
+    ================================================================== */
+    for (const selectedPeriod of normalizedPeriods) {
+      await query(
+        `
+        INSERT INTO dbo.Report_Period
+        (
+          Report_Number,
+          Period,
+          Created_At_UTC,
+          Updated_At_UTC
+        )
+        VALUES
+        (
+          @p1,
+          @p2,
+          GETUTCDATE(),
+          GETUTCDATE()
+        );
+        `,
+        [reportNumber, selectedPeriod],
+      );
+    }
+
+    /* ==================================================================
+       CREATE CURATED HEADER
+    ================================================================== */
     await query(
       `
       INSERT INTO dbo.Cur_Invoice_Header
@@ -730,12 +1291,20 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       )
       VALUES
       (
-        @p1, 'submitted', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE()
+        @p1,
+        'submitted',
+        @p2,
+        GETUTCDATE(),
+        GETUTCDATE(),
+        GETUTCDATE()
       );
       `,
       [reportNumber, uploaded_by],
     );
 
+    /* ==================================================================
+       STAGE DETAIL ROWS
+    ================================================================== */
     const stageSql = `
       INSERT INTO dbo.Stg_Invoice_Raw
       (
@@ -773,9 +1342,36 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       )
       VALUES
       (
-        @p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, @p9, @p10,
-        @p11, @p12, @p13, @p14, @p15, @p16, @p17, @p18, @p19, @p20,
-        @p21, @p22, @p23, @p24, @p25, @p26, @p27, @p28, @p29, @p30,
+        @p1,
+        @p2,
+        @p3,
+        @p4,
+        @p5,
+        @p6,
+        @p7,
+        @p8,
+        @p9,
+        @p10,
+        @p11,
+        @p12,
+        @p13,
+        @p14,
+        @p15,
+        @p16,
+        @p17,
+        @p18,
+        @p19,
+        @p20,
+        @p21,
+        @p22,
+        @p23,
+        @p24,
+        @p25,
+        @p26,
+        @p27,
+        @p28,
+        @p29,
+        @p30,
         GETUTCDATE()
       );
     `;
@@ -815,17 +1411,23 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       ]);
     }
 
+    /* ==================================================================
+       TRIGGER INFORMATICA / PROCESSING PIPELINE
+    ================================================================== */
     let trigger_result = null;
 
     try {
       if (process.env.PIPELINE_TRIGGER_URL) {
         const triggerRes = await fetch(process.env.PIPELINE_TRIGGER_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+          },
           body: JSON.stringify({
             report_number: reportNumber,
             report_type,
-            period,
+            period: periodSummary,
+            periods: normalizedPeriods,
             bp_code: finalBpCode,
             contract_id: contract_id || null,
             related_report_number: related_report_number || null,
@@ -844,8 +1446,16 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         ok: false,
         error: triggerErr.message,
       };
+
+      console.warn(
+        "Manual report pipeline trigger failed:",
+        triggerErr.message,
+      );
     }
 
+    /* ==================================================================
+       AUDIT LOG
+    ================================================================== */
     try {
       await query(
         `
@@ -869,7 +1479,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
           JSON.stringify({
             report_number: reportNumber,
             report_type,
-            period,
+            period: periodSummary,
+            periods: normalizedPeriods,
             bp_code: finalBpCode,
             contract_id: contract_id || null,
             related_report_number: related_report_number || null,
@@ -884,10 +1495,17 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       console.warn("Manual report audit log skipped:", auditErr.message);
     }
 
+    /* ==================================================================
+       RESPONSE
+    ================================================================== */
     res.json({
       ok: true,
       report_number: reportNumber,
-      report,
+      report: {
+        ...report,
+        period: periodSummary,
+        periods: normalizedPeriods,
+      },
       row_count: rows.length,
       status: "submitted",
       trigger_result,
@@ -895,7 +1513,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         "Manual report created and staged for validation. Informatica processing will determine final DQ status.",
     });
   } catch (err) {
-    console.error("POST /reports/manual-create error:", err);
+    console.error("❌ POST /reports/manual-create error:", err);
     next(err);
   }
 });
