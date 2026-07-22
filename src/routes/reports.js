@@ -1640,21 +1640,19 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     for (const selectedPeriod of resolvedPeriods) {
       await query(
         `
-        INSERT INTO dbo.Report_Period
-        (
-          Report_Number,
-          Period,
-          Created_At_UTC,
-          Updated_At_UTC
-        )
-        VALUES
-        (
-          @p1,
-          @p2,
-          GETUTCDATE(),
-          GETUTCDATE()
-        );
-        `,
+    INSERT INTO dbo.Report_Period
+    (
+      Report_Number,
+      Period,
+      Created_At_UTC
+    )
+    VALUES
+    (
+      @p1,
+      @p2,
+      GETUTCDATE()
+    );
+    `,
         [reportNumber, selectedPeriod],
       );
     }
