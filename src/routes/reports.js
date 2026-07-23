@@ -36,6 +36,28 @@ const reverseAmount = (value) => {
   return numericValue === null ? null : numericValue * -1;
 };
 
+const validateOpenPeriods = async (periods) => {
+  if (!periods.length) return;
+
+  const placeholders = periods.map((_, i) => `@p${i + 1}`).join(",");
+
+  const { rows } = await query(
+    `
+    SELECT Period
+    FROM dbo.Accounting_Period
+    WHERE Is_Frozen = 1
+      AND Period IN (${placeholders})
+    `,
+    periods,
+  );
+
+  if (rows.length > 0) {
+    throw new Error(
+      `Accounting period(s) closed: ${rows.map((r) => r.Period).join(", ")}`,
+    );
+  }
+};
+
 /* ======================================================================
    REGISTER REPORT (Metadata only)
 ====================================================================== */
@@ -1420,6 +1442,18 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         });
       }
 
+      /* ================================================================
+   VERIFY ACCOUNTING PERIOD IS OPEN
+================================================================ */
+
+      try {
+        await validateOpenPeriods(resolvedPeriods);
+      } catch (e) {
+        return res.status(400).json({
+          error: e.message,
+        });
+      }
+
       /*
        * Copy approved processed rows from Cur_Invoice_Detail.
        *
@@ -1525,6 +1559,17 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       });
     }
 
+    /* ================================================================
+   VERIFY ACCOUNTING PERIOD IS OPEN
+================================================================ */
+
+    try {
+      await validateOpenPeriods(resolvedPeriods);
+    } catch (e) {
+      return res.status(400).json({
+        error: e.message,
+      });
+    }
     /* ==================================================================
        PERIOD SUMMARY
     ================================================================== */
@@ -1943,5 +1988,36 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     next(error);
   }
 });
+
+/* ============================================================================
+   ACCOUNTING PERIOD STATUS
+============================================================================ */
+
+router.get(
+  "/reports/accounting-periods",
+  requireAuth,
+  async (_req, res, next) => {
+    try {
+      const { rows } = await query(`
+        SELECT
+            Period AS period,
+            CASE
+                WHEN Is_Frozen = 1 THEN 'closed'
+                ELSE 'open'
+            END AS status,
+            Freeze_Reason AS reason
+        FROM dbo.Accounting_Period
+        ORDER BY Period DESC;
+      `);
+
+      res.json({
+        periods: rows,
+      });
+    } catch (err) {
+      console.error(err);
+      next(err);
+    }
+  },
+);
 
 export default router;
