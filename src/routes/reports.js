@@ -37,24 +37,87 @@ const reverseAmount = (value) => {
 };
 
 const validateOpenPeriods = async (periods) => {
-  if (!periods.length) return;
+  const normalizedPeriods = Array.from(
+    new Set(
+      (Array.isArray(periods) ? periods : [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    ),
+  );
 
-  const placeholders = periods.map((_, i) => `@p${i + 1}`).join(",");
+  if (normalizedPeriods.length === 0) {
+    return;
+  }
+
+  const placeholders = normalizedPeriods
+    .map((_, index) => `@p${index + 1}`)
+    .join(", ");
 
   const { rows } = await query(
     `
-    SELECT Period
+    SELECT
+      Period AS period,
+      Is_Locked AS is_locked,
+      Locked_By AS locked_by,
+      Locked_At_UTC AS locked_at_utc
     FROM dbo.Accounting_Period
-    WHERE Is_Frozen = 1
-      AND Period IN (${placeholders})
+    WHERE Period IN (${placeholders});
     `,
-    periods,
+    normalizedPeriods,
   );
 
-  if (rows.length > 0) {
-    throw new Error(
-      `Accounting period(s) closed: ${rows.map((r) => r.Period).join(", ")}`,
+  const configuredPeriodMap = new Map(
+    rows.map((row) => [
+      String(row.period || "").trim(),
+      {
+        isLocked: Boolean(row.is_locked),
+        lockedBy: row.locked_by || null,
+        lockedAtUtc: row.locked_at_utc || null,
+      },
+    ]),
+  );
+
+  /*
+   * Block periods that are not configured.
+   */
+  const missingPeriods = normalizedPeriods.filter(
+    (selectedPeriod) => !configuredPeriodMap.has(selectedPeriod),
+  );
+
+  if (missingPeriods.length > 0) {
+    const error = new Error(
+      `The following accounting period(s) are not configured: ${missingPeriods.join(
+        ", ",
+      )}.`,
     );
+
+    error.statusCode = 400;
+    error.code = "ACCOUNTING_PERIOD_NOT_CONFIGURED";
+    error.periods = missingPeriods;
+
+    throw error;
+  }
+
+  /*
+   * Block configured periods that are locked.
+   */
+  const lockedPeriods = normalizedPeriods.filter(
+    (selectedPeriod) =>
+      configuredPeriodMap.get(selectedPeriod)?.isLocked === true,
+  );
+
+  if (lockedPeriods.length > 0) {
+    const error = new Error(
+      `The following accounting period(s) are closed: ${lockedPeriods.join(
+        ", ",
+      )}.`,
+    );
+
+    error.statusCode = 400;
+    error.code = "ACCOUNTING_PERIOD_CLOSED";
+    error.periods = lockedPeriods;
+
+    throw error;
   }
 };
 
@@ -1442,18 +1505,6 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
         });
       }
 
-      /* ================================================================
-   VERIFY ACCOUNTING PERIOD IS OPEN
-================================================================ */
-
-      try {
-        await validateOpenPeriods(resolvedPeriods);
-      } catch (e) {
-        return res.status(400).json({
-          error: e.message,
-        });
-      }
-
       /*
        * Copy approved processed rows from Cur_Invoice_Detail.
        *
@@ -1565,9 +1616,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
     try {
       await validateOpenPeriods(resolvedPeriods);
-    } catch (e) {
-      return res.status(400).json({
-        error: e.message,
+    } catch (periodError) {
+      return res.status(periodError.statusCode || 400).json({
+        error: periodError.message,
+        code: periodError.code || "ACCOUNTING_PERIOD_VALIDATION_FAILED",
+        periods: periodError.periods || [],
       });
     }
     /* ==================================================================
@@ -1989,9 +2042,13 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
   }
 });
 
-/* ============================================================================
+/* ======================================================================
    ACCOUNTING PERIOD STATUS
-============================================================================ */
+====================================================================== */
+
+/* ======================================================================
+   ACCOUNTING PERIOD STATUS
+====================================================================== */
 
 router.get(
   "/reports/accounting-periods",
@@ -2000,22 +2057,36 @@ router.get(
     try {
       const { rows } = await query(`
         SELECT
-            Period AS period,
-            CASE
-                WHEN Is_Frozen = 1 THEN 'closed'
-                ELSE 'open'
-            END AS status,
-            Freeze_Reason AS reason
+          Period AS period,
+
+          CASE
+            WHEN Is_Locked = 1 THEN 'closed'
+            ELSE 'open'
+          END AS status,
+
+          CAST(NULL AS NVARCHAR(500)) AS reason,
+
+          Locked_By AS closed_by,
+          Locked_At_UTC AS closed_at_utc,
+
+          Unlocked_By AS unlocked_by,
+          Unlocked_At_UTC AS unlocked_at_utc
+
         FROM dbo.Accounting_Period
+
+        WHERE Period IS NOT NULL
+          AND LTRIM(RTRIM(Period)) <> ''
+
         ORDER BY Period DESC;
       `);
 
-      res.json({
+      return res.json({
         periods: rows,
       });
-    } catch (err) {
-      console.error(err);
-      next(err);
+    } catch (error) {
+      console.error("❌ GET /reports/accounting-periods error:", error);
+
+      next(error);
     }
   },
 );
