@@ -250,14 +250,43 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
           .map((value) => String(value || "").trim())
           .filter(Boolean),
       ),
-    );
+    ).sort((left, right) => left.localeCompare(right));
+
+    /*
+     * At least one accounting period is required.
+     */
+    if (normalizedPeriods.length === 0) {
+      return res.status(400).json({
+        error: "At least one accounting period is required",
+        code: "ACCOUNTING_PERIOD_REQUIRED",
+        periods: [],
+      });
+    }
+
+    /*
+     * Verify all selected accounting periods:
+     *
+     * 1. Exist in dbo.Accounting_Period
+     * 2. Are currently open
+     *
+     * If one selected period is missing or locked,
+     * the complete report registration is blocked.
+     */
+    try {
+      await validateOpenPeriods(normalizedPeriods);
+    } catch (periodError) {
+      return res.status(periodError.statusCode || 400).json({
+        error: periodError.message,
+        code: periodError.code || "ACCOUNTING_PERIOD_VALIDATION_FAILED",
+        periods: periodError.periods || [],
+      });
+    }
 
     /*
      * Keep Report_Number.Period for backward compatibility.
      * For multiple periods, store a comma-separated summary.
      */
-    const periodSummary =
-      normalizedPeriods.length > 0 ? normalizedPeriods.join(", ") : null;
+    const periodSummary = normalizedPeriods.join(", ");
 
     const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
 
@@ -368,7 +397,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
     }
 
     /*
-     * Audit logging should not fail the report registration.
+     * Audit logging should not fail report registration.
      */
     try {
       await query(
@@ -407,7 +436,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       console.warn("Register report audit log skipped:", auditErr.message);
     }
 
-    res.json({
+    return res.json({
       ok: true,
       report: {
         ...report,
@@ -417,6 +446,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
     });
   } catch (err) {
     console.error("❌ POST /reports/register error:", err);
+
     next(err);
   }
 });
