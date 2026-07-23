@@ -121,6 +121,88 @@ const validateOpenPeriods = async (periods) => {
   }
 };
 
+// ============================================================
+// ACCOUNTING PERIOD HELPERS
+// ============================================================
+
+/**
+ * Accepts YYYY-MM only.
+ *
+ * Valid:
+ *   2026-01
+ *   2026-12
+ *
+ * Invalid:
+ *   01-2026
+ *   2026-1
+ *   July 2026
+ */
+function normalizeAccountingPeriod(value) {
+  const period = String(value || "").trim();
+
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
+    return null;
+  }
+
+  return period;
+}
+
+/**
+ * Returns the current logged-in user's best available identifier.
+ *
+ * Update these property names if your /me endpoint uses different fields.
+ */
+function getCurrentUserIdentifier(req) {
+  return (
+    req.user?.email ||
+    req.user?.username ||
+    req.user?.display_name ||
+    req.session?.user?.email ||
+    req.session?.user?.username ||
+    req.session?.user?.display_name ||
+    "Unknown User"
+  );
+}
+
+/**
+ * Checks whether the current user is an internal user.
+ *
+ * Business Partner users have user_type = "bp".
+ */
+function isInternalUser(req) {
+  const userType = String(
+    req.user?.user_type || req.session?.user?.user_type || "",
+  )
+    .trim()
+    .toLowerCase();
+
+  return userType !== "bp";
+}
+
+/**
+ * Middleware used by the period-management write APIs.
+ *
+ * All internal users are allowed.
+ */
+function requireInternalAccountingPeriodAccess(req, res, next) {
+  if (!req.user && !req.session?.user) {
+    return res.status(401).json({
+      success: false,
+      code: "UNAUTHENTICATED",
+      message: "Authentication is required.",
+    });
+  }
+
+  if (!isInternalUser(req)) {
+    return res.status(403).json({
+      success: false,
+      code: "INTERNAL_USER_REQUIRED",
+      message: "Only internal users can manage accounting periods.",
+    });
+  }
+
+  return next();
+}
 /* ======================================================================
    REGISTER REPORT (Metadata only)
 ====================================================================== */
@@ -2050,41 +2132,554 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
    ACCOUNTING PERIOD STATUS
 ====================================================================== */
 
+/* ======================================================================
+   ACCOUNTING PERIOD MANAGEMENT
+
+   Permissions:
+   - Authenticated internal users can view periods
+   - Authenticated internal users can create periods
+   - Authenticated internal users can lock periods
+   - Authenticated internal users can unlock periods
+
+   Table:
+   dbo.Accounting_Period
+
+   Columns:
+   - Accounting_Period_ID
+   - Period
+   - Is_Locked
+   - Locked_By
+   - Locked_At_UTC
+   - Unlocked_By
+   - Unlocked_At_UTC
+   - Created_At_UTC
+   - Updated_At_UTC
+====================================================================== */
+
+/* ======================================================================
+   GET /reports/accounting-periods
+====================================================================== */
+
 router.get(
   "/reports/accounting-periods",
   requireAuth,
+  requireInternalAccountingPeriodAccess,
   async (_req, res, next) => {
     try {
       const { rows } = await query(`
         SELECT
+          Accounting_Period_ID AS accounting_period_id,
           Period AS period,
-
-          CASE
-            WHEN Is_Locked = 1 THEN 'closed'
-            ELSE 'open'
-          END AS status,
-
-          CAST(NULL AS NVARCHAR(500)) AS reason,
-
-          Locked_By AS closed_by,
-          Locked_At_UTC AS closed_at_utc,
-
+          Is_Locked AS is_locked,
+          Locked_By AS locked_by,
+          Locked_At_UTC AS locked_at_utc,
           Unlocked_By AS unlocked_by,
-          Unlocked_At_UTC AS unlocked_at_utc
-
+          Unlocked_At_UTC AS unlocked_at_utc,
+          Created_At_UTC AS created_at_utc,
+          Updated_At_UTC AS updated_at_utc
         FROM dbo.Accounting_Period
-
-        WHERE Period IS NOT NULL
-          AND LTRIM(RTRIM(Period)) <> ''
-
         ORDER BY Period DESC;
       `);
 
-      return res.json({
-        periods: rows,
+      const periods = rows.map((row) => ({
+        accounting_period_id: row.accounting_period_id,
+        period: row.period,
+        is_locked: Boolean(row.is_locked),
+        status: Boolean(row.is_locked) ? "closed" : "open",
+        locked_by: row.locked_by || null,
+        locked_at_utc: row.locked_at_utc || null,
+        unlocked_by: row.unlocked_by || null,
+        unlocked_at_utc: row.unlocked_at_utc || null,
+        created_at_utc: row.created_at_utc || null,
+        updated_at_utc: row.updated_at_utc || null,
+      }));
+
+      return res.status(200).json({
+        success: true,
+        count: periods.length,
+        periods,
       });
     } catch (error) {
       console.error("❌ GET /reports/accounting-periods error:", error);
+      next(error);
+    }
+  },
+);
+
+/* ======================================================================
+   POST /reports/accounting-periods
+   Creates a new accounting period as Open
+====================================================================== */
+
+router.post(
+  "/reports/accounting-periods",
+  requireAuth,
+  requireInternalAccountingPeriodAccess,
+  async (req, res, next) => {
+    try {
+      const period = normalizeAccountingPeriod(req.body?.period);
+
+      if (!period) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_ACCOUNTING_PERIOD",
+          message: "Accounting period must use YYYY-MM format.",
+        });
+      }
+
+      /*
+       * Check whether the period already exists.
+       */
+      const { rows: existingRows } = await query(
+        `
+        SELECT
+          Accounting_Period_ID AS accounting_period_id,
+          Period AS period,
+          Is_Locked AS is_locked
+        FROM dbo.Accounting_Period
+        WHERE Period = @p1;
+        `,
+        [period],
+      );
+
+      if (existingRows.length > 0) {
+        return res.status(409).json({
+          success: false,
+          code: "ACCOUNTING_PERIOD_ALREADY_EXISTS",
+          message: `Accounting period ${period} already exists.`,
+          period: {
+            accounting_period_id: existingRows[0].accounting_period_id,
+            period: existingRows[0].period,
+            is_locked: Boolean(existingRows[0].is_locked),
+            status: Boolean(existingRows[0].is_locked) ? "closed" : "open",
+          },
+        });
+      }
+
+      /*
+       * Create the period as Open.
+       */
+      const { rows: insertedRows } = await query(
+        `
+        INSERT INTO dbo.Accounting_Period
+        (
+          Period,
+          Is_Locked,
+          Locked_By,
+          Locked_At_UTC,
+          Unlocked_By,
+          Unlocked_At_UTC,
+          Created_At_UTC,
+          Updated_At_UTC
+        )
+        OUTPUT
+          INSERTED.Accounting_Period_ID AS accounting_period_id,
+          INSERTED.Period AS period,
+          INSERTED.Is_Locked AS is_locked,
+          INSERTED.Locked_By AS locked_by,
+          INSERTED.Locked_At_UTC AS locked_at_utc,
+          INSERTED.Unlocked_By AS unlocked_by,
+          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
+          INSERTED.Created_At_UTC AS created_at_utc,
+          INSERTED.Updated_At_UTC AS updated_at_utc
+        VALUES
+        (
+          @p1,
+          0,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          GETUTCDATE(),
+          GETUTCDATE()
+        );
+        `,
+        [period],
+      );
+
+      const row = insertedRows[0];
+
+      /*
+       * Audit failure should not fail period creation.
+       */
+      try {
+        await query(
+          `
+          INSERT INTO dbo.Users_Audit_Log
+          (
+            User_Email,
+            Action,
+            Context_JSON,
+            Created_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            'create_accounting_period',
+            @p2,
+            GETUTCDATE()
+          );
+          `,
+          [
+            getCurrentUserIdentifier(req),
+            JSON.stringify({
+              period,
+              status: "open",
+            }),
+          ],
+        );
+      } catch (auditError) {
+        console.warn(
+          "Create accounting period audit log skipped:",
+          auditError.message,
+        );
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: `Accounting period ${period} was created successfully.`,
+        period: {
+          accounting_period_id: row.accounting_period_id,
+          period: row.period,
+          is_locked: Boolean(row.is_locked),
+          status: "open",
+          locked_by: row.locked_by || null,
+          locked_at_utc: row.locked_at_utc || null,
+          unlocked_by: row.unlocked_by || null,
+          unlocked_at_utc: row.unlocked_at_utc || null,
+          created_at_utc: row.created_at_utc || null,
+          updated_at_utc: row.updated_at_utc || null,
+        },
+      });
+    } catch (error) {
+      console.error("❌ POST /reports/accounting-periods error:", error);
+
+      /*
+       * SQL Server duplicate-key errors.
+       *
+       * This protects against two users creating the same month
+       * at nearly the same time.
+       */
+      if (error?.number === 2601 || error?.number === 2627) {
+        return res.status(409).json({
+          success: false,
+          code: "ACCOUNTING_PERIOD_ALREADY_EXISTS",
+          message: "This accounting period already exists.",
+        });
+      }
+
+      next(error);
+    }
+  },
+);
+
+/* ======================================================================
+   PUT /reports/accounting-periods/:period/lock
+====================================================================== */
+
+router.put(
+  "/reports/accounting-periods/:period/lock",
+  requireAuth,
+  requireInternalAccountingPeriodAccess,
+  async (req, res, next) => {
+    try {
+      const period = normalizeAccountingPeriod(req.params?.period);
+      const lockedBy = getCurrentUserIdentifier(req);
+
+      if (!period) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_ACCOUNTING_PERIOD",
+          message: "Accounting period must use YYYY-MM format.",
+        });
+      }
+
+      /*
+       * Update only when the period exists and is currently open.
+       *
+       * This condition makes the operation safe when two users
+       * try to lock the same period at the same time.
+       */
+      const { rows: updatedRows } = await query(
+        `
+        UPDATE dbo.Accounting_Period
+        SET
+          Is_Locked = 1,
+          Locked_By = @p2,
+          Locked_At_UTC = GETUTCDATE(),
+          Unlocked_By = NULL,
+          Unlocked_At_UTC = NULL,
+          Updated_At_UTC = GETUTCDATE()
+        OUTPUT
+          INSERTED.Accounting_Period_ID AS accounting_period_id,
+          INSERTED.Period AS period,
+          INSERTED.Is_Locked AS is_locked,
+          INSERTED.Locked_By AS locked_by,
+          INSERTED.Locked_At_UTC AS locked_at_utc,
+          INSERTED.Unlocked_By AS unlocked_by,
+          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
+          INSERTED.Created_At_UTC AS created_at_utc,
+          INSERTED.Updated_At_UTC AS updated_at_utc
+        WHERE Period = @p1
+          AND Is_Locked = 0;
+        `,
+        [period, lockedBy],
+      );
+
+      if (updatedRows.length === 0) {
+        const { rows: existingRows } = await query(
+          `
+          SELECT
+            Accounting_Period_ID AS accounting_period_id,
+            Period AS period,
+            Is_Locked AS is_locked,
+            Locked_By AS locked_by,
+            Locked_At_UTC AS locked_at_utc
+          FROM dbo.Accounting_Period
+          WHERE Period = @p1;
+          `,
+          [period],
+        );
+
+        if (existingRows.length === 0) {
+          return res.status(404).json({
+            success: false,
+            code: "ACCOUNTING_PERIOD_NOT_FOUND",
+            message: `Accounting period ${period} is not configured.`,
+          });
+        }
+
+        const existingPeriod = existingRows[0];
+
+        return res.status(409).json({
+          success: false,
+          code: "ACCOUNTING_PERIOD_ALREADY_LOCKED",
+          message: `Accounting period ${period} is already locked.`,
+          period: {
+            accounting_period_id: existingPeriod.accounting_period_id,
+            period: existingPeriod.period,
+            is_locked: true,
+            status: "closed",
+            locked_by: existingPeriod.locked_by || null,
+            locked_at_utc: existingPeriod.locked_at_utc || null,
+          },
+        });
+      }
+
+      const row = updatedRows[0];
+
+      /*
+       * Audit failure should not fail the lock operation.
+       */
+      try {
+        await query(
+          `
+          INSERT INTO dbo.Users_Audit_Log
+          (
+            User_Email,
+            Action,
+            Context_JSON,
+            Created_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            'lock_accounting_period',
+            @p2,
+            GETUTCDATE()
+          );
+          `,
+          [
+            lockedBy,
+            JSON.stringify({
+              period,
+              status: "closed",
+              locked_by: lockedBy,
+            }),
+          ],
+        );
+      } catch (auditError) {
+        console.warn(
+          "Lock accounting period audit log skipped:",
+          auditError.message,
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Accounting period ${period} was locked successfully.`,
+        period: {
+          accounting_period_id: row.accounting_period_id,
+          period: row.period,
+          is_locked: true,
+          status: "closed",
+          locked_by: row.locked_by || null,
+          locked_at_utc: row.locked_at_utc || null,
+          unlocked_by: row.unlocked_by || null,
+          unlocked_at_utc: row.unlocked_at_utc || null,
+          created_at_utc: row.created_at_utc || null,
+          updated_at_utc: row.updated_at_utc || null,
+        },
+      });
+    } catch (error) {
+      console.error(
+        `❌ PUT /reports/accounting-periods/${req.params?.period}/lock error:`,
+        error,
+      );
+
+      next(error);
+    }
+  },
+);
+
+/* ======================================================================
+   PUT /reports/accounting-periods/:period/unlock
+====================================================================== */
+
+router.put(
+  "/reports/accounting-periods/:period/unlock",
+  requireAuth,
+  requireInternalAccountingPeriodAccess,
+  async (req, res, next) => {
+    try {
+      const period = normalizeAccountingPeriod(req.params?.period);
+      const unlockedBy = getCurrentUserIdentifier(req);
+
+      if (!period) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_ACCOUNTING_PERIOD",
+          message: "Accounting period must use YYYY-MM format.",
+        });
+      }
+
+      /*
+       * Update only when the period exists and is currently locked.
+       */
+      const { rows: updatedRows } = await query(
+        `
+        UPDATE dbo.Accounting_Period
+        SET
+          Is_Locked = 0,
+          Unlocked_By = @p2,
+          Unlocked_At_UTC = GETUTCDATE(),
+          Updated_At_UTC = GETUTCDATE()
+        OUTPUT
+          INSERTED.Accounting_Period_ID AS accounting_period_id,
+          INSERTED.Period AS period,
+          INSERTED.Is_Locked AS is_locked,
+          INSERTED.Locked_By AS locked_by,
+          INSERTED.Locked_At_UTC AS locked_at_utc,
+          INSERTED.Unlocked_By AS unlocked_by,
+          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
+          INSERTED.Created_At_UTC AS created_at_utc,
+          INSERTED.Updated_At_UTC AS updated_at_utc
+        WHERE Period = @p1
+          AND Is_Locked = 1;
+        `,
+        [period, unlockedBy],
+      );
+
+      if (updatedRows.length === 0) {
+        const { rows: existingRows } = await query(
+          `
+          SELECT
+            Accounting_Period_ID AS accounting_period_id,
+            Period AS period,
+            Is_Locked AS is_locked,
+            Unlocked_By AS unlocked_by,
+            Unlocked_At_UTC AS unlocked_at_utc
+          FROM dbo.Accounting_Period
+          WHERE Period = @p1;
+          `,
+          [period],
+        );
+
+        if (existingRows.length === 0) {
+          return res.status(404).json({
+            success: false,
+            code: "ACCOUNTING_PERIOD_NOT_FOUND",
+            message: `Accounting period ${period} is not configured.`,
+          });
+        }
+
+        const existingPeriod = existingRows[0];
+
+        return res.status(409).json({
+          success: false,
+          code: "ACCOUNTING_PERIOD_ALREADY_OPEN",
+          message: `Accounting period ${period} is already open.`,
+          period: {
+            accounting_period_id: existingPeriod.accounting_period_id,
+            period: existingPeriod.period,
+            is_locked: false,
+            status: "open",
+            unlocked_by: existingPeriod.unlocked_by || null,
+            unlocked_at_utc: existingPeriod.unlocked_at_utc || null,
+          },
+        });
+      }
+
+      const row = updatedRows[0];
+
+      /*
+       * Audit failure should not fail the unlock operation.
+       */
+      try {
+        await query(
+          `
+          INSERT INTO dbo.Users_Audit_Log
+          (
+            User_Email,
+            Action,
+            Context_JSON,
+            Created_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            'unlock_accounting_period',
+            @p2,
+            GETUTCDATE()
+          );
+          `,
+          [
+            unlockedBy,
+            JSON.stringify({
+              period,
+              status: "open",
+              unlocked_by: unlockedBy,
+            }),
+          ],
+        );
+      } catch (auditError) {
+        console.warn(
+          "Unlock accounting period audit log skipped:",
+          auditError.message,
+        );
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Accounting period ${period} was unlocked successfully.`,
+        period: {
+          accounting_period_id: row.accounting_period_id,
+          period: row.period,
+          is_locked: false,
+          status: "open",
+          locked_by: row.locked_by || null,
+          locked_at_utc: row.locked_at_utc || null,
+          unlocked_by: row.unlocked_by || null,
+          unlocked_at_utc: row.unlocked_at_utc || null,
+          created_at_utc: row.created_at_utc || null,
+          updated_at_utc: row.updated_at_utc || null,
+        },
+      });
+    } catch (error) {
+      console.error(
+        `❌ PUT /reports/accounting-periods/${req.params?.period}/unlock error:`,
+        error,
+      );
 
       next(error);
     }
