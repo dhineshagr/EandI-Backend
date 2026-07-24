@@ -45,6 +45,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       "uploaded_at_utc",
       "report_status",
       "period",
+      "supplier_name",
       "bp_code",
       "contract_id",
       "passed_count",
@@ -76,6 +77,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           OR rn.Period LIKE @p${idx}
           OR period_data.selected_periods LIKE @p${idx}
           OR rn.BP_Code LIKE @p${idx}
+          OR s.Supplier_Name LIKE @p${idx}
           OR CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}
         )
       `);
@@ -85,13 +87,20 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     }
 
     if (supplier) {
-      conditions.push(`rn.BP_Code LIKE @p${idx}`);
+      conditions.push(`
+        (
+          rn.BP_Code LIKE @p${idx}
+          OR s.Supplier_Name LIKE @p${idx}
+        )
+      `);
+
       values.push(`%${supplier}%`);
       idx++;
     }
 
     if (contract) {
       conditions.push(`CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}`);
+
       values.push(`%${contract}%`);
       idx++;
     }
@@ -126,10 +135,6 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       }
 
       if (endDate) {
-        /*
-         * Treat endDate as the complete selected day instead of midnight
-         * at the beginning of that day.
-         */
         conditions.push(`${dateColumn} < DATEADD(DAY, 1, @p${idx})`);
         values.push(endDate);
         idx++;
@@ -159,11 +164,6 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx += statusList.length;
     }
 
-    /*
-     * Use one shared CTE for both the data query and count query.
-     * Periods are aggregated before detail rows are counted, preventing
-     * Report_Period from multiplying Cur_Invoice_Detail rows.
-     */
     const baseCte = `
       ;WITH base AS (
         SELECT
@@ -178,6 +178,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           ) AS period,
 
           rn.BP_Code AS bp_code,
+          s.Supplier_Name AS supplier_name,
           rn.Contract_ID AS contract_id,
 
           rn.Uploaded_By AS uploaded_by,
@@ -218,12 +219,20 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           ) AS approved_count,
 
           COALESCE(
-            SUM(TRY_CAST(d.Purchase_Dollars_Calc AS DECIMAL(19, 2))),
+            SUM(
+              TRY_CAST(
+                d.Purchase_Dollars_Calc AS DECIMAL(19, 2)
+              )
+            ),
             0
           ) AS total_purchase,
 
           COALESCE(
-            SUM(TRY_CAST(d.CAF_Dollars AS DECIMAL(19, 2))),
+            SUM(
+              TRY_CAST(
+                d.CAF_Dollars AS DECIMAL(19, 2)
+              )
+            ),
             0
           ) AS total_caf,
 
@@ -233,10 +242,18 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
                 OR UPPER(LTRIM(RTRIM(rn.Filename))) LIKE 'ZERO_SALES%'
                 THEN 'submitted'
 
-              WHEN LOWER(COALESCE(NULLIF(h.Report_Status, ''), '')) =
-                   'approved'
-                OR LOWER(COALESCE(NULLIF(rn.Status, ''), '')) =
-                   'approved'
+              WHEN LOWER(
+                COALESCE(
+                  NULLIF(h.Report_Status, ''),
+                  ''
+                )
+              ) = 'approved'
+                OR LOWER(
+                  COALESCE(
+                    NULLIF(rn.Status, ''),
+                    ''
+                  )
+                ) = 'approved'
                 THEN 'approved'
 
               WHEN SUM(
@@ -268,8 +285,12 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
                 ) = 0
                 THEN 'passed'
 
-              WHEN LOWER(COALESCE(NULLIF(rn.Status, ''), '')) IN
-                   ('new', 'staged', 'pending', 'submitted')
+              WHEN LOWER(
+                COALESCE(
+                  NULLIF(rn.Status, ''),
+                  ''
+                )
+              ) IN ('new', 'staged', 'pending', 'submitted')
                 THEN 'submitted'
 
               ELSE COALESCE(
@@ -280,6 +301,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           ) AS report_status
 
         FROM Report_Number rn
+
+        LEFT JOIN Ref_Supplier s
+          ON s.BP_Code = rn.BP_Code
 
         LEFT JOIN Cur_Invoice_Header h
           ON h.Report_Number = rn.Report_Number
@@ -311,6 +335,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           rn.Period,
           period_data.selected_periods,
           rn.BP_Code,
+          s.Supplier_Name,
           rn.Contract_ID,
           rn.Uploaded_By,
           rn.Uploaded_By_Name,
@@ -363,6 +388,7 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ SSP reports error:", err);
+
     res.status(500).json({
       error: "Failed to load SSP reports",
     });

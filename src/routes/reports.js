@@ -446,6 +446,7 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         ) AS period,
 
         r.BP_Code AS bp_code,
+        s.Supplier_Name AS supplier_name,
         r.Contract_ID AS contract_id,
         r.Related_Report_Number AS related_report_number,
 
@@ -574,6 +575,9 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
 
       FROM dbo.Report_Number r
 
+      LEFT JOIN dbo.Ref_Supplier s
+        ON s.BP_Code = r.BP_Code
+
       LEFT JOIN dbo.Cur_Invoice_Detail d
         ON d.Report_Number = r.Report_Number
 
@@ -603,6 +607,7 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.Period,
         period_data.selected_periods,
         r.BP_Code,
+        s.Supplier_Name,
         r.Contract_ID,
         r.Related_Report_Number,
         r.Uploaded_By,
@@ -678,6 +683,7 @@ router.get(
           ) AS period,
 
           r.BP_Code AS bp_code,
+          s.Supplier_Name AS supplier_name,
           r.Contract_ID AS contract_id,
           r.Related_Report_Number AS related_report_number,
 
@@ -802,6 +808,9 @@ router.get(
 
         FROM dbo.Report_Number r
 
+        LEFT JOIN dbo.Ref_Supplier s
+          ON s.BP_Code = r.BP_Code
+
         LEFT JOIN dbo.Cur_Invoice_Detail d
           ON d.Report_Number = r.Report_Number
 
@@ -833,6 +842,7 @@ router.get(
           r.Period,
           period_data.selected_periods,
           r.BP_Code,
+          s.Supplier_Name,
           r.Contract_ID,
           r.Related_Report_Number,
           r.Uploaded_By,
@@ -864,6 +874,7 @@ router.get(
         period: row.period || null,
         periods,
         bp_code: row.bp_code || null,
+        supplier_name: row.supplier_name || null,
         contract_id: row.contract_id || null,
         related_report_number: row.related_report_number || null,
         uploaded_by: row.uploaded_by || null,
@@ -888,6 +899,7 @@ router.get(
       });
     } catch (err) {
       console.error("❌ GET /reports/:reportNumber/summary error:", err);
+
       next(err);
     }
   },
