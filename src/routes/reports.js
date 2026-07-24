@@ -3067,23 +3067,32 @@ router.delete(
 
         await txQuery(
           `
-          INSERT INTO dbo.Users_Audit_Log
-          (
-            User_Email,
-            Action,
-            Context_JSON,
-            Created_At_UTC
-          )
-          VALUES
-          (
-            @p1,
-            'delete_report',
-            @p2,
-            GETUTCDATE()
-          );
-          `,
+  INSERT INTO dbo.Users_Audit_Log
+  (
+    User_ID,
+    Action,
+    Context,
+    Created_At_UTC,
+    Old_Values,
+    New_Values,
+    Changed_By,
+    Changed_At
+  )
+  VALUES
+  (
+    @p1,
+    'delete_report',
+    @p2,
+    GETUTCDATE(),
+    @p3,
+    NULL,
+    @p4,
+    GETUTCDATE()
+  );
+  `,
           [
-            deletedBy,
+            req.user?.user_id || null,
+
             JSON.stringify({
               report_number: report.report_number,
               filename: report.filename,
@@ -3103,6 +3112,15 @@ router.delete(
               deleted_by_role: req.user?.role || null,
               deleted_counts: deletionCounts,
             }),
+
+            JSON.stringify({
+              report_number: report.report_number,
+              filename: report.filename,
+              report_type: report.report_type,
+              status: report.status,
+            }),
+
+            deletedBy,
           ],
         );
 
