@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { query } from "../db.js";
+import { query, withTransaction } from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -7,9 +7,9 @@ const router = Router();
 /* ======================================================================
    Helpers
 ====================================================================== */
-const asInt = (v, d = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
+const asInt = (value, defaultValue = 0) => {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : defaultValue;
 };
 
 const nullIfEmpty = (value) => {
@@ -36,7 +36,7 @@ const reverseAmount = (value) => {
   return numericValue === null ? null : numericValue * -1;
 };
 
-const validateOpenPeriods = async (periods) => {
+const validateOpenPeriods = async (periods, queryFn = query) => {
   const normalizedPeriods = Array.from(
     new Set(
       (Array.isArray(periods) ? periods : [])
@@ -60,7 +60,7 @@ const validateOpenPeriods = async (periods) => {
    * Is_Locked = 0                           = open
    * Is_Locked = 1                           = closed
    */
-  const { rows } = await query(
+  const { rows } = await queryFn(
     `
     SELECT
       Period AS period,
@@ -151,6 +151,133 @@ function isInternalUser(req) {
   return userType !== "bp";
 }
 
+function isBpUser(req) {
+  return (
+    String(req.user?.user_type || "")
+      .trim()
+      .toLowerCase() === "bp"
+  );
+}
+
+function getBpCode(req) {
+  return String(req.user?.bp_code || "").trim();
+}
+
+function normalizePeriods(periods = [], legacyPeriod = null) {
+  return Array.from(
+    new Set(
+      [
+        ...(Array.isArray(periods) ? periods : []),
+        ...(legacyPeriod ? [legacyPeriod] : []),
+      ]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right));
+}
+
+function getInvalidAccountingPeriods(periods) {
+  return (periods || []).filter((period) => !normalizeAccountingPeriod(period));
+}
+
+function sendInvalidPeriodResponse(res, invalidPeriods) {
+  return res.status(400).json({
+    error: "Accounting periods must use YYYY-MM format",
+    code: "INVALID_ACCOUNTING_PERIOD",
+    periods: invalidPeriods,
+  });
+}
+
+async function verifyReportAccess(req, reportNumber, queryFn = query) {
+  if (!reportNumber) {
+    const error = new Error("Invalid report number");
+    error.statusCode = 400;
+    error.code = "INVALID_REPORT_NUMBER";
+    throw error;
+  }
+
+  const { rows } = await queryFn(
+    `
+    SELECT TOP 1
+      Report_Number AS report_number,
+      BP_Code AS bp_code,
+      Report_Type AS report_type,
+      Status AS status
+    FROM dbo.Report_Number
+    WHERE Report_Number = @p1;
+    `,
+    [reportNumber],
+  );
+
+  if (!rows.length) {
+    const error = new Error("Report not found");
+    error.statusCode = 404;
+    error.code = "REPORT_NOT_FOUND";
+    throw error;
+  }
+
+  const report = rows[0];
+
+  if (isBpUser(req)) {
+    const userBpCode = getBpCode(req);
+    const reportBpCode = String(report.bp_code || "").trim();
+
+    if (
+      !userBpCode ||
+      userBpCode.toLowerCase() !== reportBpCode.toLowerCase()
+    ) {
+      const error = new Error("You do not have access to this report");
+      error.statusCode = 403;
+      error.code = "REPORT_ACCESS_DENIED";
+      throw error;
+    }
+  }
+
+  return report;
+}
+
+function sendRouteError(res, next, error) {
+  if (error?.statusCode) {
+    return res.status(error.statusCode).json({
+      error: error.message,
+      code: error.code || "REQUEST_FAILED",
+    });
+  }
+
+  return next(error);
+}
+
+const editableDetailFields = new Set([
+  "customer_id",
+  "member_number",
+  "member_name",
+  "member_address",
+  "member_city",
+  "member_state",
+  "member_zip",
+  "po",
+  "invoice",
+  "invoice_date",
+  "ship_to",
+  "ship_to_address",
+  "ship_to_city",
+  "ship_to_state",
+  "ship_to_zip",
+  "item",
+  "manufacturer",
+  "manufacturer_part",
+  "um",
+  "description",
+  "unspsc",
+  "category",
+  "subcategory",
+  "retail_price",
+  "contract_price",
+  "qty",
+  "purchase_dollars",
+  "caf",
+]);
+
 /**
  * Middleware used by the period-management write APIs.
  *
@@ -198,35 +325,12 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       related_report_number = null,
     } = req.body || {};
 
-    if (!filename) {
-      return res.status(400).json({
-        error: "filename is required",
-      });
+    if (!String(filename || "").trim()) {
+      return res.status(400).json({ error: "filename is required" });
     }
 
-    /*
-     * Normalize periods.
-     *
-     * New request:
-     * periods: ["2026-04", "2026-05"]
-     *
-     * Legacy request:
-     * period: "2026-04"
-     */
-    const normalizedPeriods = Array.from(
-      new Set(
-        [
-          ...(Array.isArray(periods) ? periods : []),
-          ...(period ? [period] : []),
-        ]
-          .map((value) => String(value || "").trim())
-          .filter(Boolean),
-      ),
-    ).sort((left, right) => left.localeCompare(right));
+    const normalizedPeriods = normalizePeriods(periods, period);
 
-    /*
-     * At least one accounting period is required.
-     */
     if (normalizedPeriods.length === 0) {
       return res.status(400).json({
         error: "At least one accounting period is required",
@@ -235,190 +339,152 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
       });
     }
 
-    /*
-     * Verify that none of the selected accounting periods are locked.
-     *
-     * Business rule:
-     * - Missing database row = open
-     * - Is_Locked = 0        = open
-     * - Is_Locked = 1        = blocked
-     */
-    try {
-      await validateOpenPeriods(normalizedPeriods);
-    } catch (periodError) {
-      return res.status(periodError.statusCode || 400).json({
-        error: periodError.message,
-        code: periodError.code || "ACCOUNTING_PERIOD_VALIDATION_FAILED",
-        periods: periodError.periods || [],
+    const invalidPeriods = getInvalidAccountingPeriods(normalizedPeriods);
+    if (invalidPeriods.length > 0) {
+      return sendInvalidPeriodResponse(res, invalidPeriods);
+    }
+
+    const resolvedBpCode = isBpUser(req)
+      ? getBpCode(req)
+      : nullIfEmpty(typeof bp_code === "string" ? bp_code.trim() : bp_code);
+
+    if (isBpUser(req) && !resolvedBpCode) {
+      return res.status(403).json({
+        error: "A supplier code is not assigned to this Business Partner user",
+        code: "BP_CODE_REQUIRED",
       });
     }
 
-    /*
-     * Keep Report_Number.Period for backward compatibility.
-     * For multiple periods, store a comma-separated summary.
-     */
+    const relatedReportNumber = related_report_number
+      ? asInt(related_report_number)
+      : null;
+
+    if (related_report_number && !relatedReportNumber) {
+      return res.status(400).json({
+        error: "related_report_number must be a positive integer",
+      });
+    }
+
+    if (relatedReportNumber) {
+      await verifyReportAccess(req, relatedReportNumber);
+    }
+
+    await validateOpenPeriods(normalizedPeriods);
+
     const periodSummary = normalizedPeriods.join(", ");
-
-    const uploaded_by = req.user?.email || req.user?.username || "unknown@user";
-
-    const uploaded_by_name =
+    const uploadedBy = req.user?.email || req.user?.username || "unknown@user";
+    const uploadedByName =
       req.user?.display_name ||
       req.user?.name ||
       req.user?.username ||
       (req.user?.email ? req.user.email.split("@")[0] : "Unknown");
+    const uploadedByType = req.user?.user_type || "internal";
 
-    const uploaded_by_type = req.user?.user_type || "internal";
-
-    const reportInsertSql = `
-      INSERT INTO dbo.Report_Number
-      (
-        FileName,
-        Report_Type,
-        Uploaded_By,
-        Uploaded_By_Name,
-        Uploaded_By_Type,
-        Period,
-        BP_Code,
-        Contract_ID,
-        Related_Report_Number,
-        Uploaded_At_UTC,
-        Status,
-        Note,
-        Created_At_UTC,
-        Updated_At_UTC
-      )
-      OUTPUT
-        INSERTED.Report_Number AS report_number,
-        INSERTED.FileName AS filename,
-        INSERTED.Report_Type AS report_type,
-        INSERTED.Period AS period,
-        INSERTED.BP_Code AS bp_code,
-        INSERTED.Contract_ID AS contract_id,
-        INSERTED.Related_Report_Number AS related_report_number,
-        INSERTED.Uploaded_By AS uploaded_by,
-        INSERTED.Uploaded_By_Name AS uploaded_by_name,
-        INSERTED.Uploaded_By_Type AS uploaded_by_type,
-        INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
-        INSERTED.Status AS status,
-        INSERTED.Note AS note
-      VALUES
-      (
-        @p1,
-        @p2,
-        @p3,
-        @p4,
-        @p5,
-        @p6,
-        @p7,
-        @p8,
-        @p9,
-        GETUTCDATE(),
-        'new',
-        @p10,
-        GETUTCDATE(),
-        GETUTCDATE()
-      );
-    `;
-
-    const { rows: reportRows } = await query(reportInsertSql, [
-      filename,
-      report_type,
-      uploaded_by,
-      uploaded_by_name,
-      uploaded_by_type,
-      periodSummary,
-      bp_code || null,
-      contract_id || null,
-      related_report_number || null,
-      note || "",
-    ]);
-
-    const report = reportRows?.[0];
-    const reportNumber = report?.report_number;
-
-    if (!reportNumber) {
-      return res.status(500).json({
-        error: "Failed to register report",
-      });
-    }
-
-    /*
-     * Insert one row per selected accounting period.
-     */
-    for (const selectedPeriod of normalizedPeriods) {
-      await query(
+    const result = await withTransaction(async (txQuery) => {
+      const { rows: reportRows } = await txQuery(
         `
-        INSERT INTO dbo.Report_Period
+        INSERT INTO dbo.Report_Number
         (
-          Report_Number,
-          Period,
-          Created_At_UTC,
-          Updated_At_UTC
+          FileName, Report_Type, Uploaded_By, Uploaded_By_Name,
+          Uploaded_By_Type, Period, BP_Code, Contract_ID,
+          Related_Report_Number, Uploaded_At_UTC, Status, Note,
+          Created_At_UTC, Updated_At_UTC
         )
+        OUTPUT
+          INSERTED.Report_Number AS report_number,
+          INSERTED.FileName AS filename,
+          INSERTED.Report_Type AS report_type,
+          INSERTED.Period AS period,
+          INSERTED.BP_Code AS bp_code,
+          INSERTED.Contract_ID AS contract_id,
+          INSERTED.Related_Report_Number AS related_report_number,
+          INSERTED.Uploaded_By AS uploaded_by,
+          INSERTED.Uploaded_By_Name AS uploaded_by_name,
+          INSERTED.Uploaded_By_Type AS uploaded_by_type,
+          INSERTED.Uploaded_At_UTC AS uploaded_at_utc,
+          INSERTED.Status AS status,
+          INSERTED.Note AS note
         VALUES
         (
-          @p1,
-          @p2,
-          GETUTCDATE(),
-          GETUTCDATE()
-        );
-        `,
-        [reportNumber, selectedPeriod],
-      );
-    }
-
-    /*
-     * Audit logging should not fail report registration.
-     */
-    try {
-      await query(
-        `
-        INSERT INTO dbo.Users_Audit_Log
-        (
-          User_Email,
-          Action,
-          Context_JSON,
-          Created_At_UTC
-        )
-        VALUES
-        (
-          @p1,
-          'register_report',
-          @p2,
-          GETUTCDATE()
+          @p1, @p2, @p3, @p4, @p5, @p6, @p7,
+          @p8, @p9, GETUTCDATE(), 'new', @p10,
+          GETUTCDATE(), GETUTCDATE()
         );
         `,
         [
-          uploaded_by,
-          JSON.stringify({
-            report_number: reportNumber,
-            filename,
-            report_type,
-            note,
-            period: periodSummary,
-            periods: normalizedPeriods,
-            bp_code: bp_code || null,
-            contract_id: contract_id || null,
-            related_report_number: related_report_number || null,
-          }),
+          String(filename).trim(),
+          report_type,
+          uploadedBy,
+          uploadedByName,
+          uploadedByType,
+          periodSummary,
+          resolvedBpCode,
+          nullIfEmpty(contract_id),
+          relatedReportNumber,
+          note || "",
         ],
       );
-    } catch (auditErr) {
-      console.warn("Register report audit log skipped:", auditErr.message);
-    }
+
+      const report = reportRows?.[0];
+      const reportNumber = report?.report_number;
+
+      if (!reportNumber) {
+        throw new Error("Failed to register report");
+      }
+
+      for (const selectedPeriod of normalizedPeriods) {
+        await txQuery(
+          `
+          INSERT INTO dbo.Report_Period
+          (
+            Report_Number, Period, Created_At_UTC, Updated_At_UTC
+          )
+          VALUES (@p1, @p2, GETUTCDATE(), GETUTCDATE());
+          `,
+          [reportNumber, selectedPeriod],
+        );
+      }
+
+      try {
+        await txQuery(
+          `
+          INSERT INTO dbo.Users_Audit_Log
+          (User_Email, Action, Context_JSON, Created_At_UTC)
+          VALUES (@p1, 'register_report', @p2, GETUTCDATE());
+          `,
+          [
+            uploadedBy,
+            JSON.stringify({
+              report_number: reportNumber,
+              filename: String(filename).trim(),
+              report_type,
+              note,
+              period: periodSummary,
+              periods: normalizedPeriods,
+              bp_code: resolvedBpCode,
+              contract_id: nullIfEmpty(contract_id),
+              related_report_number: relatedReportNumber,
+            }),
+          ],
+        );
+      } catch (auditError) {
+        console.warn("Register report audit log skipped:", auditError.message);
+      }
+
+      return { report, reportNumber };
+    });
 
     return res.json({
       ok: true,
       report: {
-        ...report,
+        ...result.report,
         period: periodSummary,
         periods: normalizedPeriods,
       },
     });
-  } catch (err) {
-    console.error("❌ POST /reports/register error:", err);
-
-    next(err);
+  } catch (error) {
+    console.error("❌ POST /reports/register error:", error);
+    return sendRouteError(res, next, error);
   }
 });
 
@@ -432,7 +498,7 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
    - Returns both period and periods[]
    - Prevents Report_Period from multiplying detail-row totals
 ====================================================================== */
-router.get("/reports/list", requireAuth, async (_req, res, next) => {
+router.get("/reports/list", requireAuth, async (req, res, next) => {
   try {
     const sql = `
       SELECT
@@ -495,6 +561,26 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
             ELSE 0
           END
         ) AS validated_count,
+
+        /* Purchase total for this report */
+        COALESCE(
+          SUM(
+            TRY_CAST(
+              d.Purchase_Dollars_Calc AS DECIMAL(19, 2)
+            )
+          ),
+          0
+        ) AS total_purchase,
+
+        /* CAF total for this report */
+        COALESCE(
+          SUM(
+            TRY_CAST(
+              d.CAF_Dollars AS DECIMAL(19, 2)
+            )
+          ),
+          0
+        ) AS total_caf,
 
         CASE
           /*
@@ -564,7 +650,13 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
            * Preserve current Report_Number status when available.
            */
           WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) IN
-            ('new', 'staged', 'submitted', 'pending', 'processing')
+            (
+              'new',
+              'staged',
+              'submitted',
+              'pending',
+              'processing'
+            )
             THEN LOWER(r.Status)
 
           /*
@@ -592,13 +684,20 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
             ', '
           ) AS selected_periods
         FROM (
-          SELECT DISTINCT rp.Period
+          SELECT DISTINCT
+            rp.Period
           FROM dbo.Report_Period rp
           WHERE rp.Report_Number = r.Report_Number
             AND rp.Period IS NOT NULL
-            AND LTRIM(RTRIM(CAST(rp.Period AS NVARCHAR(50)))) <> ''
+            AND LTRIM(
+              RTRIM(
+                CAST(rp.Period AS NVARCHAR(50))
+              )
+            ) <> ''
         ) period_rows
       ) period_data
+
+      WHERE (@p1 = 0 OR LOWER(LTRIM(RTRIM(r.BP_Code))) = LOWER(@p2))
 
       GROUP BY
         r.Report_Number,
@@ -616,16 +715,22 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
         r.Uploaded_At_UTC,
         r.Status
 
-      ORDER BY r.Uploaded_At_UTC DESC;
+      ORDER BY
+        r.Uploaded_At_UTC DESC;
     `;
 
-    const { rows } = await query(sql);
+    const bpOnly = isBpUser(req) ? 1 : 0;
+    const bpCode = isBpUser(req) ? getBpCode(req) : "";
 
-    /*
-     * Return both:
-     * period  = "2026-04, 2026-05"
-     * periods = ["2026-04", "2026-05"]
-     */
+    if (isBpUser(req) && !bpCode) {
+      return res.status(403).json({
+        error: "A supplier code is not assigned to this Business Partner user",
+        code: "BP_CODE_REQUIRED",
+      });
+    }
+
+    const { rows } = await query(sql, [bpOnly, bpCode]);
+
     const reports = rows.map((report) => {
       const periods = String(report.period || "")
         .split(",")
@@ -635,10 +740,13 @@ router.get("/reports/list", requireAuth, async (_req, res, next) => {
       return {
         ...report,
         periods,
+
+        total_purchase: Number(report.total_purchase || 0),
+        total_caf: Number(report.total_caf || 0),
       };
     });
 
-    res.json({
+    return res.json({
       reports,
     });
   } catch (err) {
@@ -666,10 +774,10 @@ router.get(
       const rn = asInt(req.params.reportNumber);
 
       if (!rn) {
-        return res.status(400).json({
-          error: "Invalid report number",
-        });
+        return res.status(400).json({ error: "Invalid report number" });
       }
+
+      await verifyReportAccess(req, rn);
 
       const sql = `
         SELECT
@@ -731,6 +839,26 @@ router.get(
               ELSE 0
             END
           ) AS validated_count,
+
+          /* Purchase total for this report */
+          COALESCE(
+            SUM(
+              TRY_CAST(
+                d.Purchase_Dollars_Calc AS DECIMAL(19, 2)
+              )
+            ),
+            0
+          ) AS purchase_total,
+
+          /* CAF total for this report */
+          COALESCE(
+            SUM(
+              TRY_CAST(
+                d.CAF_Dollars AS DECIMAL(19, 2)
+              )
+            ),
+            0
+          ) AS caf_total,
 
           CASE
             /*
@@ -800,7 +928,13 @@ router.get(
              * Preserve an existing processing status.
              */
             WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) IN
-              ('new', 'staged', 'submitted', 'pending', 'processing')
+              (
+                'new',
+                'staged',
+                'submitted',
+                'pending',
+                'processing'
+              )
               THEN LOWER(r.Status)
 
             ELSE 'pending'
@@ -821,7 +955,8 @@ router.get(
               ', '
             ) AS selected_periods
           FROM (
-            SELECT DISTINCT rp.Period
+            SELECT DISTINCT
+              rp.Period
             FROM dbo.Report_Period rp
             WHERE rp.Report_Number = r.Report_Number
               AND rp.Period IS NOT NULL
@@ -893,14 +1028,20 @@ router.get(
         validated_count: Number(row.validated_count || 0),
       };
 
-      res.json({
+      const totals = {
+        purchase_total: Number(row.purchase_total || 0),
+        caf_total: Number(row.caf_total || 0),
+      };
+
+      return res.json({
         report,
         counts,
+        totals,
       });
     } catch (err) {
       console.error("❌ GET /reports/:reportNumber/summary error:", err);
 
-      next(err);
+      return sendRouteError(res, next, err);
     }
   },
 );
@@ -915,6 +1056,12 @@ router.get(
     try {
       const rn = asInt(req.params.reportNumber);
       const { status, dq } = req.query;
+
+      if (!rn) {
+        return res.status(400).json({ error: "Invalid report number" });
+      }
+
+      await verifyReportAccess(req, rn);
 
       let sql = `
       SELECT *
@@ -948,7 +1095,7 @@ router.get(
       });
     } catch (err) {
       console.error("❌ GET rows error:", err);
-      next(err);
+      return sendRouteError(res, next, err);
     }
   },
 );
@@ -963,69 +1110,68 @@ router.put(
     try {
       const rn = asInt(req.params.reportNumber);
       const curDetailId = asInt(req.params.curDetailId);
-      const { field_name, new_value, reason } = req.body || {};
+      const fieldName = String(req.body?.field_name || "")
+        .trim()
+        .toLowerCase();
+      const { new_value, reason } = req.body || {};
 
-      if (!field_name) {
+      if (!rn) return res.status(400).json({ error: "Invalid report number" });
+      if (!curDetailId)
+        return res.status(400).json({ error: "Invalid detail row ID" });
+      if (!fieldName)
         return res.status(400).json({ error: "field_name required" });
-      }
-
-      const { rows: cols } = await query(`
-      SELECT column_name
-      FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE table_name='cur_invoice_detail';
-    `);
-
-      const allowed = cols.map((c) => c.column_name);
-      const readOnly = [
-        "cur_detail_id",
-        "report_number",
-        "approved_by",
-        "approved_at_utc",
-        "created_at_utc",
-        "updated_at_utc",
-      ];
-
-      if (!allowed.includes(field_name) || readOnly.includes(field_name)) {
+      if (!editableDetailFields.has(fieldName)) {
         return res.status(400).json({ error: "Invalid or read-only field" });
       }
 
-      const { rows: oldRows } = await query(
-        `SELECT CAST(${field_name} AS NVARCHAR(MAX)) AS old_value
-       FROM cur_invoice_detail
-       WHERE cur_detail_id=@p1 AND report_number=@p2`,
-        [curDetailId, rn],
-      );
+      await verifyReportAccess(req, rn);
 
-      if (!oldRows.length)
-        return res.status(404).json({ error: "Row not found" });
+      const result = await withTransaction(async (txQuery) => {
+        const { rows: oldRows } = await txQuery(
+          `SELECT CAST(${fieldName} AS NVARCHAR(MAX)) AS old_value
+           FROM dbo.Cur_Invoice_Detail
+           WHERE Cur_Detail_ID=@p1 AND Report_Number=@p2;`,
+          [curDetailId, rn],
+        );
 
-      const { rows: updRows } = await query(
-        `UPDATE cur_invoice_detail
-       SET ${field_name}=@p1, updated_at_utc=GETUTCDATE()
-       OUTPUT INSERTED.*
-       WHERE cur_detail_id=@p2 AND report_number=@p3`,
-        [new_value, curDetailId, rn],
-      );
+        if (!oldRows.length) {
+          const error = new Error("Row not found");
+          error.statusCode = 404;
+          error.code = "DETAIL_ROW_NOT_FOUND";
+          throw error;
+        }
 
-      await query(
-        `INSERT INTO audit_log
-       (report_number,row_key,field_name,old_value,new_value,changed_by,change_reason,changed_at_utc)
-       VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,GETUTCDATE())`,
-        [
-          rn,
-          curDetailId,
-          field_name,
-          oldRows[0].old_value,
-          String(new_value ?? ""),
-          req.user?.email || "internal",
-          reason || "Manual correction",
-        ],
-      );
+        const { rows: updatedRows } = await txQuery(
+          `UPDATE dbo.Cur_Invoice_Detail
+           SET ${fieldName}=@p1, Updated_At_UTC=GETUTCDATE()
+           OUTPUT INSERTED.*
+           WHERE Cur_Detail_ID=@p2 AND Report_Number=@p3;`,
+          [new_value, curDetailId, rn],
+        );
 
-      res.json({ ok: true, row: updRows[0] });
-    } catch (err) {
-      console.error("❌ UPDATE row error:", err);
-      next(err);
+        await txQuery(
+          `INSERT INTO dbo.Audit_Log
+           (Report_Number, Row_Key, Field_Name, Old_Value, New_Value,
+            Changed_By, Change_Reason, Changed_At_UTC)
+           VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,GETUTCDATE());`,
+          [
+            rn,
+            curDetailId,
+            fieldName,
+            oldRows[0].old_value,
+            String(new_value ?? ""),
+            getCurrentUserIdentifier(req),
+            reason || "Manual correction",
+          ],
+        );
+
+        return updatedRows[0];
+      });
+
+      return res.json({ ok: true, row: result });
+    } catch (error) {
+      console.error("❌ UPDATE row error:", error);
+      return sendRouteError(res, next, error);
     }
   },
 );
@@ -1041,66 +1187,74 @@ router.put(
   async (req, res, next) => {
     try {
       const rn = asInt(req.params.reportNumber);
-      const approver = req.user?.email || "internal";
+      if (!rn) return res.status(400).json({ error: "Invalid report number" });
 
-      const detailUpd = await query(
-        `UPDATE cur_invoice_detail
-         SET dq_status='approved',
-             approved_by=@p1,
-             approved_at_utc=GETUTCDATE(),
-             updated_at_utc=GETUTCDATE()
-         OUTPUT INSERTED.cur_detail_id, INSERTED.dq_status
-         WHERE report_number=@p2
-           AND dq_status IN ('passed','failed','validated','new','staged');`,
-        [approver, rn],
-      );
+      await verifyReportAccess(req, rn);
+      const approver = getCurrentUserIdentifier(req);
 
-      for (const row of detailUpd.rows) {
-        await query(
-          `INSERT INTO audit_log
-           (report_number, row_key, field_name, old_value, new_value,
-            changed_by, change_reason, changed_at_utc)
-           VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,'bulk approve',GETUTCDATE());`,
-          [rn, row.cur_detail_id, row.dq_status, approver],
+      const approvedRows = await withTransaction(async (txQuery) => {
+        const detailUpdate = await txQuery(
+          `UPDATE dbo.Cur_Invoice_Detail
+           SET DQ_Status='approved',
+               Approved_By=@p1,
+               Approved_At_UTC=GETUTCDATE(),
+               Updated_At_UTC=GETUTCDATE()
+           OUTPUT INSERTED.Cur_Detail_ID AS cur_detail_id,
+                  DELETED.DQ_Status AS old_status
+           WHERE Report_Number=@p2
+             AND LOWER(COALESCE(DQ_Status, '')) IN
+                 ('passed','failed','validated','new','staged');`,
+          [approver, rn],
         );
-      }
 
-      await query(
-        `UPDATE cur_invoice_header
-         SET report_status='approved',
-             approved_by=@p1,
-             approved_at_utc=GETUTCDATE(),
-             updated_at_utc=GETUTCDATE()
-         WHERE report_number=@p2;`,
-        [approver, rn],
-      );
+        for (const row of detailUpdate.rows) {
+          await txQuery(
+            `INSERT INTO dbo.Audit_Log
+             (Report_Number, Row_Key, Field_Name, Old_Value, New_Value,
+              Changed_By, Change_Reason, Changed_At_UTC)
+             VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,
+                     'bulk approve',GETUTCDATE());`,
+            [rn, row.cur_detail_id, row.old_status, approver],
+          );
+        }
 
-      await query(
-        `UPDATE report_number
-         SET status='approved',
-             updated_at_utc=GETUTCDATE()
-         WHERE report_number=@p1;`,
-        [rn],
-      );
-
-      try {
-        await query(
-          `INSERT INTO users_audit_log (user_email, action, context_json, created_at_utc)
-           VALUES (@p1,'bulk_approve',@p2,GETUTCDATE());`,
-          [approver, JSON.stringify({ report_number: rn })],
+        await txQuery(
+          `UPDATE dbo.Cur_Invoice_Header
+           SET Report_Status='approved', Approved_By=@p1,
+               Approved_At_UTC=GETUTCDATE(), Updated_At_UTC=GETUTCDATE()
+           WHERE Report_Number=@p2;`,
+          [approver, rn],
         );
-      } catch (e) {
-        console.warn("users_audit_log skipped:", e.message);
-      }
 
-      res.json({
-        ok: true,
-        approved_rows: detailUpd.rows.length,
-        message: `${detailUpd.rows.length} rows approved by ${approver}`,
+        await txQuery(
+          `UPDATE dbo.Report_Number
+           SET Status='approved', Updated_At_UTC=GETUTCDATE()
+           WHERE Report_Number=@p1;`,
+          [rn],
+        );
+
+        try {
+          await txQuery(
+            `INSERT INTO dbo.Users_Audit_Log
+             (User_Email, Action, Context_JSON, Created_At_UTC)
+             VALUES (@p1,'bulk_approve',@p2,GETUTCDATE());`,
+            [approver, JSON.stringify({ report_number: rn })],
+          );
+        } catch (auditError) {
+          console.warn("users_audit_log skipped:", auditError.message);
+        }
+
+        return detailUpdate.rows;
       });
-    } catch (err) {
-      console.error("❌ PUT /reports/:reportNumber/approve error:", err);
-      next(err);
+
+      return res.json({
+        ok: true,
+        approved_rows: approvedRows.length,
+        message: `${approvedRows.length} rows approved by ${approver}`,
+      });
+    } catch (error) {
+      console.error("❌ PUT /reports/:reportNumber/approve error:", error);
+      return sendRouteError(res, next, error);
     }
   },
 );
@@ -1117,45 +1271,58 @@ router.put(
     try {
       const rn = asInt(req.params.reportNumber);
       const curDetailId = asInt(req.params.curDetailId);
-      const approver = String(req.user?.email || "internal");
 
-      const { rows: oldRows } = await query(
-        `SELECT dq_status
-         FROM cur_invoice_detail
-         WHERE report_number=@p1 AND cur_detail_id=@p2;`,
-        [rn, curDetailId],
-      );
-      if (!oldRows.length)
-        return res.status(404).json({ error: "Row not found" });
+      if (!rn) return res.status(400).json({ error: "Invalid report number" });
+      if (!curDetailId)
+        return res.status(400).json({ error: "Invalid detail row ID" });
 
-      const oldStatus = oldRows[0].dq_status;
+      await verifyReportAccess(req, rn);
+      const approver = getCurrentUserIdentifier(req);
 
-      const { rows: updRows } = await query(
-        `UPDATE cur_invoice_detail
-         SET dq_status='approved',
-             approved_by=@p3,
-             approved_at_utc=GETUTCDATE(),
-             updated_at_utc=GETUTCDATE()
-         OUTPUT INSERTED.cur_detail_id, INSERTED.dq_status, INSERTED.approved_by, INSERTED.approved_at_utc
-         WHERE report_number=@p1 AND cur_detail_id=@p2;`,
-        [rn, curDetailId, approver],
-      );
+      const updatedRow = await withTransaction(async (txQuery) => {
+        const { rows: oldRows } = await txQuery(
+          `SELECT DQ_Status AS dq_status
+           FROM dbo.Cur_Invoice_Detail
+           WHERE Report_Number=@p1 AND Cur_Detail_ID=@p2;`,
+          [rn, curDetailId],
+        );
 
-      await query(
-        `INSERT INTO audit_log
-         (report_number, row_key, field_name, old_value, new_value,
-          changed_by, change_reason, changed_at_utc)
-         VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,'single approve',GETUTCDATE());`,
-        [rn, curDetailId, oldStatus, approver],
-      );
+        if (!oldRows.length) {
+          const error = new Error("Row not found");
+          error.statusCode = 404;
+          error.code = "DETAIL_ROW_NOT_FOUND";
+          throw error;
+        }
 
-      res.json({ ok: true, row: updRows[0] });
-    } catch (err) {
-      console.error(
-        "❌ PUT /reports/:reportNumber/row/:curDetailId/approve error:",
-        err,
-      );
-      next(err);
+        const oldStatus = oldRows[0].dq_status;
+        const { rows: updatedRows } = await txQuery(
+          `UPDATE dbo.Cur_Invoice_Detail
+           SET DQ_Status='approved', Approved_By=@p3,
+               Approved_At_UTC=GETUTCDATE(), Updated_At_UTC=GETUTCDATE()
+           OUTPUT INSERTED.Cur_Detail_ID AS cur_detail_id,
+                  INSERTED.DQ_Status AS dq_status,
+                  INSERTED.Approved_By AS approved_by,
+                  INSERTED.Approved_At_UTC AS approved_at_utc
+           WHERE Report_Number=@p1 AND Cur_Detail_ID=@p2;`,
+          [rn, curDetailId, approver],
+        );
+
+        await txQuery(
+          `INSERT INTO dbo.Audit_Log
+           (Report_Number, Row_Key, Field_Name, Old_Value, New_Value,
+            Changed_By, Change_Reason, Changed_At_UTC)
+           VALUES (@p1,@p2,'dq_status',@p3,'approved',@p4,
+                   'single approve',GETUTCDATE());`,
+          [rn, curDetailId, oldStatus, approver],
+        );
+
+        return updatedRows[0];
+      });
+
+      return res.json({ ok: true, row: updatedRow });
+    } catch (error) {
+      console.error("❌ PUT single approve error:", error);
+      return sendRouteError(res, next, error);
     }
   },
 );
@@ -1168,6 +1335,9 @@ router.put(
 router.get("/:reportNumber/audit-log", requireAuth, async (req, res, next) => {
   try {
     const rn = asInt(req.params.reportNumber);
+    if (!rn) return res.status(400).json({ error: "Invalid report number" });
+    await verifyReportAccess(req, rn);
+
     const {
       action,
       changed_by,
@@ -1220,7 +1390,10 @@ router.get("/:reportNumber/audit-log", requireAuth, async (req, res, next) => {
              OFFSET @p${params.length + 1} ROWS FETCH NEXT @p${
                params.length + 2
              } ROWS ONLY;`;
-    params.push(offset, limit);
+    params.push(
+      Math.max(0, Number(offset) || 0),
+      Math.min(500, Math.max(1, Number(limit) || 50)),
+    );
 
     const { rows } = await query(sql, params);
     res.json({ logs: rows });
@@ -1241,6 +1414,9 @@ router.get(
   async (req, res, next) => {
     try {
       const rn = asInt(req.params.reportNumber);
+      if (!rn) return res.status(400).json({ error: "Invalid report number" });
+      await verifyReportAccess(req, rn);
+
       const {
         search = "",
         sort = "changed_at_utc",
@@ -1277,7 +1453,10 @@ router.get(
                OFFSET @p${params.length + 1} ROWS FETCH NEXT @p${
                  params.length + 2
                } ROWS ONLY;`;
-      params.push(offset, limit);
+      params.push(
+        Math.max(0, Number(offset) || 0),
+        Math.min(500, Math.max(1, Number(limit) || 50)),
+      );
 
       const { rows } = await query(sql, params);
       res.json({ logs: rows });
@@ -1339,19 +1518,20 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
        VALIDATE REPORT TYPE
     ================================================================== */
 
-    const allowedTypes = ["Report", "Adjustment", "Return"];
+    const allowedTypes = ["Report", "Accrual", "Adjustment", "Return"];
 
     if (!allowedTypes.includes(report_type)) {
       return res.status(400).json({
-        error: "report_type must be Report, Adjustment, or Return",
+        error: "report_type must be Report, Accrual, Adjustment, or Return",
       });
     }
 
     const isReport = report_type === "Report";
+    const isAccrual = report_type === "Accrual";
     const isAdjustment = report_type === "Adjustment";
     const isReturn = report_type === "Return";
 
-    const requiresManualRows = isReport || isAdjustment;
+    const requiresManualRows = isReport || isAccrual || isAdjustment;
 
     /* ==================================================================
        VALIDATE LINKED REPORT NUMBER
@@ -1388,21 +1568,18 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
        Return inherits periods from the linked Accrual.
     ================================================================== */
 
-    const submittedPeriods = Array.from(
-      new Set(
-        [
-          ...(Array.isArray(periods) ? periods : []),
-          ...(period ? [period] : []),
-        ]
-          .map((value) => String(value || "").trim())
-          .filter(Boolean),
-      ),
-    ).sort((left, right) => left.localeCompare(right));
+    const submittedPeriods = normalizePeriods(periods, period);
 
     if (!isReturn && submittedPeriods.length === 0) {
       return res.status(400).json({
         error: "At least one accounting period is required",
       });
+    }
+
+    const invalidSubmittedPeriods =
+      getInvalidAccountingPeriods(submittedPeriods);
+    if (!isReturn && invalidSubmittedPeriods.length > 0) {
+      return sendInvalidPeriodResponse(res, invalidSubmittedPeriods);
     }
 
     /* ==================================================================
@@ -1423,10 +1600,9 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
      * BP users must use the supplier code assigned to their login.
      * Internal users can use the supplier code selected in the UI.
      */
-    const submittedBpCode =
-      String(req.user?.user_type || "").toLowerCase() === "bp"
-        ? req.user?.bp_code || bp_code || null
-        : bp_code || null;
+    const submittedBpCode = isBpUser(req)
+      ? getBpCode(req) || null
+      : bp_code || null;
 
     /* ==================================================================
        RESOLVED VALUES
@@ -1459,6 +1635,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     ================================================================== */
 
     if (isAdjustment) {
+      await verifyReportAccess(req, linkedReportNumber);
       const { rows: linkedRows } = await query(
         `
         SELECT
@@ -1489,6 +1666,8 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     ================================================================== */
 
     if (isReturn) {
+      await verifyReportAccess(req, linkedReportNumber);
+
       /*
        * Load and validate the linked Accrual header.
        */
@@ -1709,6 +1888,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
    VERIFY ACCOUNTING PERIOD IS OPEN
 ================================================================ */
 
+    const invalidResolvedPeriods = getInvalidAccountingPeriods(resolvedPeriods);
+    if (invalidResolvedPeriods.length > 0) {
+      return sendInvalidPeriodResponse(res, invalidResolvedPeriods);
+    }
+
     try {
       await validateOpenPeriods(resolvedPeriods);
     } catch (periodError) {
@@ -1731,9 +1915,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     const manualFileName =
       report_type === "Report"
         ? "MANUAL_REPORT"
-        : report_type === "Adjustment"
-          ? "MANUAL_ADJUSTMENT"
-          : "MANUAL_RETURN";
+        : report_type === "Accrual"
+          ? "MANUAL_ACCRUAL"
+          : report_type === "Adjustment"
+            ? "MANUAL_ADJUSTMENT"
+            : "MANUAL_RETURN";
 
     /* ==================================================================
        REPORT NOTE
@@ -1803,95 +1989,52 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       );
     `;
 
-    const { rows: reportRows } = await query(reportInsertSql, [
-      manualFileName,
-      report_type,
-      uploadedBy,
-      uploadedByName,
-      uploadedByType,
-      periodSummary,
-      resolvedBpCode,
-      resolvedContractId,
-      linkedReportNumber,
-      finalNote,
-    ]);
+    const transactionResult = await withTransaction(async (txQuery) => {
+      const { rows: reportRows } = await txQuery(reportInsertSql, [
+        manualFileName,
+        report_type,
+        uploadedBy,
+        uploadedByName,
+        uploadedByType,
+        periodSummary,
+        resolvedBpCode,
+        resolvedContractId,
+        linkedReportNumber,
+        finalNote,
+      ]);
 
-    const report = reportRows?.[0];
+      const report = reportRows?.[0];
+      const reportNumber =
+        report?.report_number ?? report?.Report_Number ?? null;
 
-    const reportNumber = report?.report_number ?? report?.Report_Number ?? null;
+      if (!reportNumber) {
+        throw new Error(
+          "Failed to create report header: missing report number",
+        );
+      }
 
-    if (!reportNumber) {
-      return res.status(500).json({
-        error: "Failed to create report header: missing report number",
-      });
-    }
+      for (const selectedPeriod of resolvedPeriods) {
+        await txQuery(
+          `
+          INSERT INTO dbo.Report_Period
+          (Report_Number, Period, Created_At_UTC, Updated_At_UTC)
+          VALUES (@p1, @p2, GETUTCDATE(), GETUTCDATE());
+          `,
+          [reportNumber, selectedPeriod],
+        );
+      }
 
-    /* ==================================================================
-       STORE REPORT PERIODS
-    ================================================================== */
-
-    for (const selectedPeriod of resolvedPeriods) {
-      await query(
+      await txQuery(
         `
-    INSERT INTO dbo.Report_Period
-    (
-      Report_Number,
-      Period,
-      Created_At_UTC
-    )
-    VALUES
-    (
-      @p1,
-      @p2,
-      GETUTCDATE()
-    );
-    `,
-        [reportNumber, selectedPeriod],
+        INSERT INTO dbo.Cur_Invoice_Header
+        (Report_Number, Report_Status, Uploaded_By, Uploaded_At_UTC,
+         Created_At_UTC, Updated_At_UTC)
+        VALUES (@p1, 'submitted', @p2, GETUTCDATE(), GETUTCDATE(), GETUTCDATE());
+        `,
+        [reportNumber, uploadedBy],
       );
-    }
 
-    /* ==================================================================
-       CREATE CURATED HEADER
-    ================================================================== */
-
-    await query(
-      `
-      INSERT INTO dbo.Cur_Invoice_Header
-      (
-        Report_Number,
-        Report_Status,
-        Uploaded_By,
-        Uploaded_At_UTC,
-        Created_At_UTC,
-        Updated_At_UTC
-      )
-      VALUES
-      (
-        @p1,
-        'submitted',
-        @p2,
-        GETUTCDATE(),
-        GETUTCDATE(),
-        GETUTCDATE()
-      );
-      `,
-      [reportNumber, uploadedBy],
-    );
-
-    /* ==================================================================
-       INSERT STAGING ROWS
-
-       Verified Stg_Invoice_Raw columns:
-       - Desc
-       - Purchase_Dollars
-       - CAF
-       - CAF_Dollars
-
-       Load_Batch_ID and Source_Hash are not inserted here and must
-       remain nullable or have database defaults.
-    ================================================================== */
-
-    const stageSql = `
+      const stageSql = `
       INSERT INTO dbo.Stg_Invoice_Raw
       (
         Report_Number,
@@ -1972,49 +2115,46 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       );
     `;
 
-    for (const row of detailRowsToStage) {
-      await query(stageSql, [
-        reportNumber,
+      for (const row of detailRowsToStage) {
+        await txQuery(stageSql, [
+          reportNumber,
+          nullIfEmpty(row.customer_id),
+          nullIfEmpty(row.member_number),
+          nullIfEmpty(row.member_name),
+          nullIfEmpty(row.member_address),
+          nullIfEmpty(row.member_city),
+          nullIfEmpty(row.member_state),
+          nullIfEmpty(row.member_zip),
+          nullIfEmpty(row.po),
+          nullIfEmpty(row.invoice),
+          nullIfEmpty(row.invoice_date),
+          nullIfEmpty(row.ship_to),
+          nullIfEmpty(row.ship_to_address),
+          nullIfEmpty(row.ship_to_city),
+          nullIfEmpty(row.ship_to_state),
+          nullIfEmpty(row.ship_to_zip),
+          nullIfEmpty(row.item),
+          nullIfEmpty(row.manufacturer),
+          nullIfEmpty(row.manufacturer_part),
+          nullIfEmpty(row.um),
+          nullIfEmpty(row.desc ?? row.description),
+          nullIfEmpty(row.unspsc),
+          nullIfEmpty(row.category),
+          nullIfEmpty(row.subcategory),
+          nullableNumber(row.retail_price),
+          nullableNumber(row.contract_price),
+          nullableNumber(row.qty),
+          nullableNumber(row.purchase_dollars ?? row.purchase_dollars_calc),
+          nullableNumber(row.caf),
+          nullableNumber(row.caf_dollars),
+        ]);
+      }
 
-        nullIfEmpty(row.customer_id),
-        nullIfEmpty(row.member_number),
-        nullIfEmpty(row.member_name),
-        nullIfEmpty(row.member_address),
-        nullIfEmpty(row.member_city),
-        nullIfEmpty(row.member_state),
-        nullIfEmpty(row.member_zip),
+      return { report, reportNumber };
+    });
 
-        nullIfEmpty(row.po),
-        nullIfEmpty(row.invoice),
-        nullIfEmpty(row.invoice_date),
-
-        nullIfEmpty(row.ship_to),
-        nullIfEmpty(row.ship_to_address),
-        nullIfEmpty(row.ship_to_city),
-        nullIfEmpty(row.ship_to_state),
-        nullIfEmpty(row.ship_to_zip),
-
-        nullIfEmpty(row.item),
-        nullIfEmpty(row.manufacturer),
-        nullIfEmpty(row.manufacturer_part),
-        nullIfEmpty(row.um),
-
-        nullIfEmpty(row.desc ?? row.description),
-
-        nullIfEmpty(row.unspsc),
-        nullIfEmpty(row.category),
-        nullIfEmpty(row.subcategory),
-
-        nullableNumber(row.retail_price),
-        nullableNumber(row.contract_price),
-        nullableNumber(row.qty),
-
-        nullableNumber(row.purchase_dollars ?? row.purchase_dollars_calc),
-
-        nullableNumber(row.caf),
-        nullableNumber(row.caf_dollars),
-      ]);
-    }
+    const report = transactionResult.report;
+    const reportNumber = transactionResult.reportNumber;
 
     /* ==================================================================
        AUDIT LOG
@@ -2025,9 +2165,11 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
     try {
       const auditAction = isReturn
         ? "manual_create_return"
-        : isAdjustment
-          ? "manual_create_adjustment"
-          : "manual_create_report";
+        : isAccrual
+          ? "manual_create_accrual"
+          : isAdjustment
+            ? "manual_create_adjustment"
+            : "manual_create_report";
 
       await query(
         `
@@ -2133,7 +2275,7 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
   } catch (error) {
     console.error("❌ POST /reports/manual-create error:", error);
 
-    next(error);
+    return sendRouteError(res, next, error);
   }
 });
 
