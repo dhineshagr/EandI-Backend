@@ -2841,4 +2841,392 @@ router.put(
   },
 );
 
+/* ======================================================================
+   DELETE REPORT
+   ----------------------------------------------------------------------
+   DELETE /reports/:reportNumber
+
+   Rules:
+   - Authentication is required.
+   - Only internal Admin, Accounting, or SSP Admin users can delete.
+   - Business Partner users cannot delete.
+   - Approved reports cannot be deleted.
+   - A report cannot be deleted when another report references it through
+     Related_Report_Number.
+   - A deletion reason is required.
+   - All report records are deleted in one SQL transaction.
+   - The deletion is recorded in Users_Audit_Log.
+====================================================================== */
+
+router.delete(
+  "/reports/:reportNumber",
+  requireAuth,
+  requireAdminOrAccountingDb,
+  async (req, res, next) => {
+    try {
+      const reportNumber = asInt(req.params.reportNumber);
+
+      const deletionReason = String(
+        req.body?.reason ||
+          req.body?.deletion_reason ||
+          req.body?.delete_reason ||
+          "",
+      ).trim();
+
+      /* ----------------------------------------------------------------
+         Validate request
+      ---------------------------------------------------------------- */
+
+      if (!reportNumber) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid report number",
+          code: "INVALID_REPORT_NUMBER",
+        });
+      }
+
+      if (!deletionReason) {
+        return res.status(400).json({
+          success: false,
+          error: "Deletion reason is required",
+          code: "DELETE_REASON_REQUIRED",
+        });
+      }
+
+      if (deletionReason.length < 5) {
+        return res.status(400).json({
+          success: false,
+          error: "Deletion reason must contain at least 5 characters",
+          code: "DELETE_REASON_TOO_SHORT",
+        });
+      }
+
+      if (deletionReason.length > 1000) {
+        return res.status(400).json({
+          success: false,
+          error: "Deletion reason cannot exceed 1000 characters",
+          code: "DELETE_REASON_TOO_LONG",
+        });
+      }
+
+      const deletedBy = getCurrentUserIdentifier(req);
+
+      /* ----------------------------------------------------------------
+         Delete all report data in one transaction
+      ---------------------------------------------------------------- */
+
+      const result = await withTransaction(async (txQuery) => {
+        /* --------------------------------------------------------------
+           Lock and load the report.
+
+           UPDLOCK and HOLDLOCK prevent the report from changing while
+           the deletion transaction is running.
+        -------------------------------------------------------------- */
+
+        const { rows: reportRows } = await txQuery(
+          `
+          SELECT
+            Report_Number AS report_number,
+            FileName AS filename,
+            Report_Type AS report_type,
+            Period AS period,
+            BP_Code AS bp_code,
+            Contract_ID AS contract_id,
+            Related_Report_Number AS related_report_number,
+            Uploaded_By AS uploaded_by,
+            Uploaded_By_Name AS uploaded_by_name,
+            Uploaded_By_Type AS uploaded_by_type,
+            Uploaded_At_UTC AS uploaded_at_utc,
+            Status AS status,
+            Note AS note
+          FROM dbo.Report_Number WITH (UPDLOCK, HOLDLOCK)
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        if (!reportRows.length) {
+          const error = new Error(`Report #${reportNumber} was not found.`);
+
+          error.statusCode = 404;
+          error.code = "REPORT_NOT_FOUND";
+
+          throw error;
+        }
+
+        const report = reportRows[0];
+
+        /* --------------------------------------------------------------
+           Approved reports cannot be deleted
+        -------------------------------------------------------------- */
+
+        const normalizedStatus = String(report.status || "")
+          .trim()
+          .toLowerCase();
+
+        if (normalizedStatus === "approved") {
+          const error = new Error(
+            `Report #${reportNumber} is approved and cannot be deleted.`,
+          );
+
+          error.statusCode = 409;
+          error.code = "APPROVED_REPORT_DELETE_NOT_ALLOWED";
+
+          throw error;
+        }
+
+        /* --------------------------------------------------------------
+           Check whether another report references this report
+        -------------------------------------------------------------- */
+
+        const { rows: linkedReportRows } = await txQuery(
+          `
+          SELECT
+            Report_Number AS report_number,
+            Report_Type AS report_type,
+            Status AS status
+          FROM dbo.Report_Number
+          WHERE Related_Report_Number = @p1
+          ORDER BY Report_Number;
+          `,
+          [reportNumber],
+        );
+
+        if (linkedReportRows.length > 0) {
+          const linkedReportNumbers = linkedReportRows
+            .map((item) => item.report_number)
+            .filter(Boolean);
+
+          const error = new Error(
+            `Report #${reportNumber} cannot be deleted because it is ` +
+              `referenced by report(s): ${linkedReportNumbers.join(", ")}.`,
+          );
+
+          error.statusCode = 409;
+          error.code = "REPORT_HAS_LINKED_REPORTS";
+          error.linkedReports = linkedReportNumbers;
+
+          throw error;
+        }
+
+        /* --------------------------------------------------------------
+           Capture row counts before deleting
+        -------------------------------------------------------------- */
+
+        const { rows: countRows } = await txQuery(
+          `
+          SELECT
+            (
+              SELECT COUNT(*)
+              FROM dbo.Audit_Log
+              WHERE Report_Number = @p1
+            ) AS audit_log_count,
+
+            (
+              SELECT COUNT(*)
+              FROM dbo.Cur_Invoice_Detail
+              WHERE Report_Number = @p1
+            ) AS current_detail_count,
+
+            (
+              SELECT COUNT(*)
+              FROM dbo.Cur_Invoice_Header
+              WHERE Report_Number = @p1
+            ) AS current_header_count,
+
+            (
+              SELECT COUNT(*)
+              FROM dbo.Stg_Invoice_Raw
+              WHERE Report_Number = @p1
+            ) AS staging_row_count,
+
+            (
+              SELECT COUNT(*)
+              FROM dbo.Report_Period
+              WHERE Report_Number = @p1
+            ) AS report_period_count;
+          `,
+          [reportNumber],
+        );
+
+        const deletionCounts = {
+          audit_log: Number(countRows?.[0]?.audit_log_count || 0),
+          current_details: Number(countRows?.[0]?.current_detail_count || 0),
+          current_headers: Number(countRows?.[0]?.current_header_count || 0),
+          staging_rows: Number(countRows?.[0]?.staging_row_count || 0),
+          report_periods: Number(countRows?.[0]?.report_period_count || 0),
+          report_number: 1,
+        };
+
+        /* --------------------------------------------------------------
+           Create the permanent delete audit entry before deleting.
+
+           Users_Audit_Log does not depend on Report_Number, so this
+           record remains after the report has been removed.
+        -------------------------------------------------------------- */
+
+        await txQuery(
+          `
+          INSERT INTO dbo.Users_Audit_Log
+          (
+            User_Email,
+            Action,
+            Context_JSON,
+            Created_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            'delete_report',
+            @p2,
+            GETUTCDATE()
+          );
+          `,
+          [
+            deletedBy,
+            JSON.stringify({
+              report_number: report.report_number,
+              filename: report.filename,
+              report_type: report.report_type,
+              period: report.period,
+              bp_code: report.bp_code,
+              contract_id: report.contract_id,
+              related_report_number: report.related_report_number,
+              uploaded_by: report.uploaded_by,
+              uploaded_by_name: report.uploaded_by_name,
+              uploaded_by_type: report.uploaded_by_type,
+              uploaded_at_utc: report.uploaded_at_utc,
+              status: report.status,
+              note: report.note,
+              deletion_reason: deletionReason,
+              deleted_by: deletedBy,
+              deleted_by_role: req.user?.role || null,
+              deleted_counts: deletionCounts,
+            }),
+          ],
+        );
+
+        /* --------------------------------------------------------------
+           Delete child data first to avoid foreign-key errors
+        -------------------------------------------------------------- */
+
+        await txQuery(
+          `
+          DELETE FROM dbo.Audit_Log
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        await txQuery(
+          `
+          DELETE FROM dbo.Cur_Invoice_Detail
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        await txQuery(
+          `
+          DELETE FROM dbo.Cur_Invoice_Header
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        await txQuery(
+          `
+          DELETE FROM dbo.Stg_Invoice_Raw
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        await txQuery(
+          `
+          DELETE FROM dbo.Report_Period
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        /* --------------------------------------------------------------
+           Delete the parent Report_Number record last
+        -------------------------------------------------------------- */
+
+        const { rows: deletedReportRows } = await txQuery(
+          `
+          DELETE FROM dbo.Report_Number
+          OUTPUT
+            DELETED.Report_Number AS report_number,
+            DELETED.FileName AS filename,
+            DELETED.Report_Type AS report_type,
+            DELETED.Status AS status
+          WHERE Report_Number = @p1;
+          `,
+          [reportNumber],
+        );
+
+        if (!deletedReportRows.length) {
+          const error = new Error(
+            `Report #${reportNumber} could not be deleted.`,
+          );
+
+          error.statusCode = 409;
+          error.code = "REPORT_DELETE_FAILED";
+
+          throw error;
+        }
+
+        return {
+          report: deletedReportRows[0],
+          deleted_counts: deletionCounts,
+        };
+      });
+
+      console.log(`✅ Report #${reportNumber} deleted by ${deletedBy}.`);
+
+      return res.status(200).json({
+        success: true,
+        ok: true,
+        report_number: reportNumber,
+        deleted_report: result.report,
+        deleted_counts: result.deleted_counts,
+        deleted_by: deletedBy,
+        deletion_reason: deletionReason,
+        message: `Report #${reportNumber} was deleted successfully.`,
+      });
+    } catch (error) {
+      console.error(
+        `❌ DELETE /reports/${req.params.reportNumber} error:`,
+        error,
+      );
+
+      if (error?.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+          error: error.message,
+          code: error.code || "REPORT_DELETE_FAILED",
+          linked_reports: error.linkedReports || undefined,
+        });
+      }
+
+      /*
+       * SQL Server foreign-key constraint error.
+       */
+      if (error?.number === 547) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This report cannot be deleted because related records still " +
+            "reference it.",
+          code: "REPORT_DELETE_FOREIGN_KEY_CONFLICT",
+        });
+      }
+
+      return sendRouteError(res, next, error);
+    }
+  },
+);
+
 export default router;
