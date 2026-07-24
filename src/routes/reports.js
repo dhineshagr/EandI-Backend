@@ -53,6 +53,13 @@ const validateOpenPeriods = async (periods) => {
     .map((_, index) => `@p${index + 1}`)
     .join(", ");
 
+  /*
+   * Business rule:
+   *
+   * Period not found in dbo.Accounting_Period = open
+   * Is_Locked = 0                           = open
+   * Is_Locked = 1                           = closed
+   */
   const { rows } = await query(
     `
     SELECT
@@ -61,50 +68,15 @@ const validateOpenPeriods = async (periods) => {
       Locked_By AS locked_by,
       Locked_At_UTC AS locked_at_utc
     FROM dbo.Accounting_Period
-    WHERE Period IN (${placeholders});
+    WHERE Is_Locked = 1
+      AND Period IN (${placeholders});
     `,
     normalizedPeriods,
   );
 
-  const configuredPeriodMap = new Map(
-    rows.map((row) => [
-      String(row.period || "").trim(),
-      {
-        isLocked: Boolean(row.is_locked),
-        lockedBy: row.locked_by || null,
-        lockedAtUtc: row.locked_at_utc || null,
-      },
-    ]),
-  );
-
-  /*
-   * Block periods that are not configured.
-   */
-  const missingPeriods = normalizedPeriods.filter(
-    (selectedPeriod) => !configuredPeriodMap.has(selectedPeriod),
-  );
-
-  if (missingPeriods.length > 0) {
-    const error = new Error(
-      `The following accounting period(s) are not configured: ${missingPeriods.join(
-        ", ",
-      )}.`,
-    );
-
-    error.statusCode = 400;
-    error.code = "ACCOUNTING_PERIOD_NOT_CONFIGURED";
-    error.periods = missingPeriods;
-
-    throw error;
-  }
-
-  /*
-   * Block configured periods that are locked.
-   */
-  const lockedPeriods = normalizedPeriods.filter(
-    (selectedPeriod) =>
-      configuredPeriodMap.get(selectedPeriod)?.isLocked === true,
-  );
+  const lockedPeriods = (rows || [])
+    .map((row) => String(row.period || "").trim())
+    .filter(Boolean);
 
   if (lockedPeriods.length > 0) {
     const error = new Error(
@@ -264,13 +236,12 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
     }
 
     /*
-     * Verify all selected accounting periods:
+     * Verify that none of the selected accounting periods are locked.
      *
-     * 1. Exist in dbo.Accounting_Period
-     * 2. Are currently open
-     *
-     * If one selected period is missing or locked,
-     * the complete report registration is blocked.
+     * Business rule:
+     * - Missing database row = open
+     * - Is_Locked = 0        = open
+     * - Is_Locked = 1        = blocked
      */
     try {
       await validateOpenPeriods(normalizedPeriods);
