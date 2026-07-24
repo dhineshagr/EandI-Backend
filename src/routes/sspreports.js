@@ -32,10 +32,16 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       limit = 25,
     } = req.query;
 
+    // ================================================================
+    // PAGINATION
+    // ================================================================
     const pageNum = Math.max(1, Number(page) || 1);
     const pageSize = Math.min(100, Math.max(1, Number(limit) || 25));
     const offset = (pageNum - 1) * pageSize;
 
+    // ================================================================
+    // SORTING
+    // ================================================================
     const validSortFields = [
       "report_number",
       "related_report_number",
@@ -59,18 +65,23 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const sortOrder = String(order).toLowerCase() === "asc" ? "ASC" : "DESC";
 
+    // ================================================================
+    // QUERY PARAMETERS
+    // ================================================================
     const conditions = [];
     const values = [];
     let idx = 1;
 
-    /* ================================================================
-       SEARCH AND FILTERS
-    ================================================================ */
+    // ================================================================
+    // GENERAL SEARCH
+    // ================================================================
     if (search) {
       conditions.push(`
         (
           CAST(rn.Report_Number AS NVARCHAR(50)) LIKE @p${idx}
-          OR CAST(rn.Related_Report_Number AS NVARCHAR(50)) LIKE @p${idx}
+          OR CAST(
+            rn.Related_Report_Number AS NVARCHAR(50)
+          ) LIKE @p${idx}
           OR rn.Filename LIKE @p${idx}
           OR rn.Uploaded_By LIKE @p${idx}
           OR rn.Uploaded_By_Name LIKE @p${idx}
@@ -78,7 +89,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
           OR period_data.selected_periods LIKE @p${idx}
           OR rn.BP_Code LIKE @p${idx}
           OR s.Supplier_Name LIKE @p${idx}
-          OR CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}
+          OR CAST(
+            rn.Contract_ID AS NVARCHAR(100)
+          ) LIKE @p${idx}
         )
       `);
 
@@ -86,6 +99,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx++;
     }
 
+    // ================================================================
+    // SUPPLIER FILTER
+    // ================================================================
     if (supplier) {
       conditions.push(`
         (
@@ -98,13 +114,21 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx++;
     }
 
+    // ================================================================
+    // CONTRACT FILTER
+    // ================================================================
     if (contract) {
-      conditions.push(`CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}`);
+      conditions.push(`
+        CAST(rn.Contract_ID AS NVARCHAR(100)) LIKE @p${idx}
+      `);
 
       values.push(`%${contract}%`);
       idx++;
     }
 
+    // ================================================================
+    // MEMBER FILTER
+    // ================================================================
     if (member) {
       conditions.push(`
         EXISTS (
@@ -122,6 +146,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx++;
     }
 
+    // ================================================================
+    // DATE FILTER
+    // ================================================================
     if (startDate || endDate) {
       const dateColumn =
         dateType === "Approved_At_Utc"
@@ -135,16 +162,28 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       }
 
       if (endDate) {
-        conditions.push(`${dateColumn} < DATEADD(DAY, 1, @p${idx})`);
+        /*
+         * Includes the complete selected end date.
+         *
+         * Example:
+         * endDate = 2026-07-24
+         * Includes values before 2026-07-25 00:00:00.
+         */
+        conditions.push(`
+          ${dateColumn} < DATEADD(DAY, 1, @p${idx})
+        `);
+
         values.push(endDate);
         idx++;
       }
     }
 
-    const whereClause = conditions.length
-      ? `WHERE ${conditions.join(" AND ")}`
-      : "";
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
+    // ================================================================
+    // STATUS FILTER
+    // ================================================================
     const statusList = String(statuses || "")
       .split(",")
       .map((status) => status.trim().toLowerCase())
@@ -156,7 +195,11 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const statusFilterSql =
       statusList.length > 0
-        ? `WHERE base.report_status IN (${statusFilterParams.join(", ")})`
+        ? `
+          WHERE base.report_status IN (
+            ${statusFilterParams.join(", ")}
+          )
+        `
         : "";
 
     if (statusList.length > 0) {
@@ -164,6 +207,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       idx += statusList.length;
     }
 
+    // ================================================================
+    // SHARED BASE QUERY
+    // ================================================================
     const baseCte = `
       ;WITH base AS (
         SELECT
@@ -196,7 +242,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
           SUM(
             CASE
-              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
+              WHEN LOWER(
+                COALESCE(d.DQ_Status, '')
+              ) = 'passed'
                 THEN 1
               ELSE 0
             END
@@ -204,7 +252,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
           SUM(
             CASE
-              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+              WHEN LOWER(
+                COALESCE(d.DQ_Status, '')
+              ) = 'failed'
                 THEN 1
               ELSE 0
             END
@@ -212,7 +262,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
           SUM(
             CASE
-              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+              WHEN LOWER(
+                COALESCE(d.DQ_Status, '')
+              ) = 'approved'
                 THEN 1
               ELSE 0
             END
@@ -238,10 +290,16 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
           LOWER(
             CASE
-              WHEN UPPER(LTRIM(RTRIM(rn.Filename))) = 'ZERO_SALES'
-                OR UPPER(LTRIM(RTRIM(rn.Filename))) LIKE 'ZERO_SALES%'
+              -- Zero Sales records do not have detail rows.
+              WHEN UPPER(
+                LTRIM(RTRIM(rn.Filename))
+              ) = 'ZERO_SALES'
+                OR UPPER(
+                  LTRIM(RTRIM(rn.Filename))
+                ) LIKE 'ZERO_SALES%'
                 THEN 'submitted'
 
+              -- Header or Report Number status is approved.
               WHEN LOWER(
                 COALESCE(
                   NULLIF(h.Report_Status, ''),
@@ -256,43 +314,59 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
                 ) = 'approved'
                 THEN 'approved'
 
+              -- At least one detail row failed.
               WHEN SUM(
                 CASE
-                  WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                  WHEN LOWER(
+                    COALESCE(d.DQ_Status, '')
+                  ) = 'failed'
                     THEN 1
                   ELSE 0
                 END
               ) > 0
                 THEN 'failed'
 
+              -- All detail rows are approved.
               WHEN COUNT(d.Cur_Detail_ID) > 0
                 AND SUM(
                   CASE
-                    WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
+                    WHEN LOWER(
+                      COALESCE(d.DQ_Status, '')
+                    ) = 'approved'
                       THEN 1
                     ELSE 0
                   END
                 ) = COUNT(d.Cur_Detail_ID)
                 THEN 'approved'
 
+              -- Detail rows exist and none failed.
               WHEN COUNT(d.Cur_Detail_ID) > 0
                 AND SUM(
                   CASE
-                    WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
+                    WHEN LOWER(
+                      COALESCE(d.DQ_Status, '')
+                    ) = 'failed'
                       THEN 1
                     ELSE 0
                   END
                 ) = 0
                 THEN 'passed'
 
+              -- Processing-like statuses.
               WHEN LOWER(
                 COALESCE(
                   NULLIF(rn.Status, ''),
                   ''
                 )
-              ) IN ('new', 'staged', 'pending', 'submitted')
+              ) IN (
+                'new',
+                'staged',
+                'pending',
+                'submitted'
+              )
                 THEN 'submitted'
 
+              -- Default status.
               ELSE COALESCE(
                 NULLIF(LOWER(rn.Status), ''),
                 'submitted'
@@ -314,11 +388,14 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
         OUTER APPLY (
           SELECT
             STRING_AGG(
-              CAST(period_rows.Period AS NVARCHAR(50)),
+              CAST(
+                period_rows.Period AS NVARCHAR(50)
+              ),
               ', '
             ) AS selected_periods
           FROM (
-            SELECT DISTINCT rp.Period
+            SELECT DISTINCT
+              rp.Period
             FROM Report_Period rp
             WHERE rp.Report_Number = rn.Report_Number
               AND rp.Period IS NOT NULL
@@ -345,6 +422,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       )
     `;
 
+    // ================================================================
+    // CURRENT PAGE DATA QUERY
+    // ================================================================
     const dataSql = `
       ${baseCte}
 
@@ -358,6 +438,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const { rows } = await query(dataSql, [...values, offset, pageSize]);
 
+    // ================================================================
+    // FILTERED RECORD COUNT
+    // ================================================================
     const countSql = `
       ${baseCte}
 
@@ -368,6 +451,9 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
 
     const countResult = await query(countSql, values);
 
+    // ================================================================
+    // FORMAT REPORT RESPONSE
+    // ================================================================
     const reports = rows.map((report) => {
       const periods = String(report.period || "")
         .split(",")
@@ -380,11 +466,54 @@ router.get("/ssp/reports", requireInternalAuth, async (req, res) => {
       };
     });
 
+    // ================================================================
+    // CURRENT PAGE TOTALS
+    //
+    // These totals use only the records returned for this page.
+    //
+    // Example:
+    // Page contains 20 reports => totals for those 20 reports.
+    // Filter returns 5 reports => totals for those 5 reports.
+    // ================================================================
+    const pageTotals = reports.reduce(
+      (totals, report) => {
+        const purchaseValue = Number(report.total_purchase || 0);
+
+        const cafValue = Number(report.total_caf || 0);
+
+        totals.total_purchase += Number.isFinite(purchaseValue)
+          ? purchaseValue
+          : 0;
+
+        totals.total_caf += Number.isFinite(cafValue) ? cafValue : 0;
+
+        return totals;
+      },
+      {
+        total_purchase: 0,
+        total_caf: 0,
+      },
+    );
+
+    // Keep money values rounded to two decimal places.
+    const formattedPageTotals = {
+      record_count: reports.length,
+      total_purchase: Number(pageTotals.total_purchase.toFixed(2)),
+      total_caf: Number(pageTotals.total_caf.toFixed(2)),
+    };
+
+    // ================================================================
+    // RESPONSE
+    // ================================================================
     res.json({
       reports,
+
       total: Number(countResult.rows[0]?.total || 0),
+
       page: pageNum,
       limit: pageSize,
+
+      page_totals: formattedPageTotals,
     });
   } catch (err) {
     console.error("❌ SSP reports error:", err);
