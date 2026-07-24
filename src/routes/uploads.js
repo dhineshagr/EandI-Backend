@@ -634,10 +634,14 @@ router.get("/recent", requireAuth, async (req, res) => {
         ) AS period_count,
 
         rn.BP_Code AS bp_code,
+        s.Supplier_Name AS supplier_name,
         rn.Contract_ID AS contract_id,
         rn.Related_Report_Number AS related_report_number
 
       FROM dbo.Report_Number rn
+
+      LEFT JOIN dbo.Ref_Supplier s
+        ON s.BP_Code = rn.BP_Code
 
       OUTER APPLY
       (
@@ -849,13 +853,25 @@ router.get("/lookups/suppliers", requireAuth, async (req, res) => {
     const { rows } = await query(
       `
         SELECT TOP 20
-          BP_Code AS bp_code,
-          BP_Code AS display_name
-        FROM dbo.Ref_Contract
-        WHERE BP_Code LIKE @p1
-        GROUP BY BP_Code
-        ORDER BY BP_Code;
-        `,
+          s.BP_Code AS bp_code,
+          s.Supplier_Name AS supplier_name,
+          CONCAT(
+            s.BP_Code,
+            ' - ',
+            s.Supplier_Name
+          ) AS display_name
+        FROM dbo.Ref_Supplier s
+        WHERE
+          s.Active_Flag = 1
+          AND
+          (
+            s.BP_Code LIKE @p1
+            OR s.Supplier_Name LIKE @p1
+          )
+        ORDER BY
+          s.Supplier_Name,
+          s.BP_Code;
+      `,
       [`%${searchText}%`],
     );
 
@@ -867,6 +883,7 @@ router.get("/lookups/suppliers", requireAuth, async (req, res) => {
 
     return res.status(500).json({
       error: "Failed to search suppliers",
+      details: err.message,
     });
   }
 });
