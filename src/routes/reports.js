@@ -3061,37 +3061,103 @@ router.delete(
         /* --------------------------------------------------------------
            Create the permanent delete audit entry before deleting.
 
-           Users_Audit_Log does not depend on Report_Number, so this
-           record remains after the report has been removed.
+          * Preserve the report deletion history before removing the source data.
+          *
+          * Report_Delete_Audit intentionally has no foreign key to Report_Number
+          * because the source report is permanently deleted.
         -------------------------------------------------------------- */
 
         await txQuery(
           `
-  INSERT INTO dbo.Users_Audit_Log
+  INSERT INTO dbo.Report_Delete_Audit
   (
-    User_ID,
-    Action,
-    Context,
-    Created_At_UTC,
-    Old_Values,
-    New_Values,
-    Changed_By,
-    Changed_At
+    Report_Number,
+    FileName,
+    Report_Type,
+    Period,
+    BP_Code,
+    Contract_ID,
+    Related_Report_Number,
+
+    Report_Status,
+    Uploaded_By,
+    Uploaded_By_Name,
+    Uploaded_By_Type,
+    Uploaded_At_UTC,
+    Report_Note,
+
+    Delete_Reason,
+    Deleted_By_User_ID,
+    Deleted_By,
+    Deleted_By_Role,
+    Deleted_At_UTC,
+
+    Audit_Log_Count,
+    Current_Detail_Count,
+    Current_Header_Count,
+    Staging_Row_Count,
+    Report_Period_Count,
+
+    Report_JSON
   )
   VALUES
   (
     @p1,
-    'delete_report',
     @p2,
-    GETUTCDATE(),
     @p3,
-    NULL,
     @p4,
-    GETUTCDATE()
+    @p5,
+    @p6,
+    @p7,
+
+    @p8,
+    @p9,
+    @p10,
+    @p11,
+    @p12,
+    @p13,
+
+    @p14,
+    @p15,
+    @p16,
+    @p17,
+    GETUTCDATE(),
+
+    @p18,
+    @p19,
+    @p20,
+    @p21,
+    @p22,
+
+    @p23
   );
   `,
           [
-            req.user?.user_id || null,
+            report.report_number,
+            report.filename,
+            report.report_type,
+            report.period,
+            report.bp_code,
+            report.contract_id,
+            report.related_report_number,
+
+            report.status,
+            report.uploaded_by,
+            report.uploaded_by_name,
+            report.uploaded_by_type,
+            report.uploaded_at_utc,
+            report.note,
+
+            deletionReason,
+            req.user?.user_id ?? null,
+            deletedBy,
+            req.user?.role ?? null,
+
+            deletionCounts.audit_log,
+            deletionCounts.current_details,
+            deletionCounts.current_headers,
+            deletionCounts.staging_rows,
+            deletionCounts.report_periods,
 
             JSON.stringify({
               report_number: report.report_number,
@@ -3101,26 +3167,18 @@ router.delete(
               bp_code: report.bp_code,
               contract_id: report.contract_id,
               related_report_number: report.related_report_number,
+              status: report.status,
               uploaded_by: report.uploaded_by,
               uploaded_by_name: report.uploaded_by_name,
               uploaded_by_type: report.uploaded_by_type,
               uploaded_at_utc: report.uploaded_at_utc,
-              status: report.status,
               note: report.note,
               deletion_reason: deletionReason,
+              deleted_by_user_id: req.user?.user_id ?? null,
               deleted_by: deletedBy,
-              deleted_by_role: req.user?.role || null,
+              deleted_by_role: req.user?.role ?? null,
               deleted_counts: deletionCounts,
             }),
-
-            JSON.stringify({
-              report_number: report.report_number,
-              filename: report.filename,
-              report_type: report.report_type,
-              status: report.status,
-            }),
-
-            deletedBy,
           ],
         );
 
@@ -3241,7 +3299,22 @@ router.delete(
           code: "REPORT_DELETE_FOREIGN_KEY_CONFLICT",
         });
       }
+      if (error?.number === 208) {
+        return res.status(500).json({
+          success: false,
+          error: "Report deletion audit table was not found.",
+          code: "REPORT_DELETE_AUDIT_TABLE_NOT_FOUND",
+        });
+      }
 
+      if (error?.number === 207) {
+        return res.status(500).json({
+          success: false,
+          error:
+            "Report deletion audit table schema does not match the backend.",
+          code: "REPORT_DELETE_AUDIT_SCHEMA_MISMATCH",
+        });
+      }
       return sendRouteError(res, next, error);
     }
   },
