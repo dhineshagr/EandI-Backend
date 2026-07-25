@@ -3320,4 +3320,41 @@ router.delete(
   },
 );
 
+router.get(
+  "/report-delete-audit",
+  requireAuth,
+  requireAdminOrAccountingDb,
+  async (req, res, next) => {
+    try {
+      const { rows } = await query(
+        `
+        SELECT
+            Report_Delete_Audit_ID AS report_delete_audit_id,
+            Report_Number          AS report_number,
+            FileName               AS filename,
+            Report_Type            AS report_type,
+            Report_Status          AS report_status,
+            BP_Code                AS bp_code,
+            Period                 AS period,
+            Delete_Reason          AS delete_reason,
+            Deleted_By             AS deleted_by,
+            Deleted_By_Role        AS deleted_by_role,
+            Deleted_At_UTC         AS deleted_at_utc
+        FROM dbo.Report_Delete_Audit
+        ORDER BY Deleted_At_UTC DESC;
+        `,
+      );
+
+      return res.status(200).json({
+        success: true,
+        total: rows.length,
+        logs: rows,
+      });
+    } catch (error) {
+      console.error("❌ GET /report-delete-audit error:", error);
+      return sendRouteError(res, next, error);
+    }
+  },
+);
+
 export default router;
