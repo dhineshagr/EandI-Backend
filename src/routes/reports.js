@@ -764,6 +764,236 @@ router.get("/reports/list", requireAuth, async (req, res, next) => {
 });
 
 /* ======================================================================
+   MEMBER LOOKUP
+   GET /reports/member-lookup?q=000005
+
+   Purpose:
+   - Search Ref_Member by Member Number or Member Name.
+   - Supports leading-zero normalization.
+   - Returns results for the Selected Member Number dropdown.
+   - Admin and Accounting users only.
+====================================================================== */
+
+router.get(
+  "/reports/member-lookup",
+  requireAuth,
+  requireAdminOrAccountingDb,
+  async (req, res, next) => {
+    try {
+      const searchValue = String(req.query?.q || "").trim();
+
+      /*
+       * Do not execute a full-table search when no search value was supplied.
+       */
+      if (!searchValue) {
+        return res.status(200).json({
+          success: true,
+          count: 0,
+          items: [],
+        });
+      }
+
+      /*
+       * Keep the lookup responsive and prevent very large responses.
+       */
+      const requestedLimit = Number(req.query?.limit);
+
+      const limit = Number.isInteger(requestedLimit)
+        ? Math.min(50, Math.max(1, requestedLimit))
+        : 20;
+
+      const containsSearch = `%${searchValue}%`;
+      const startsWithSearch = `${searchValue}%`;
+
+      const { rows } = await query(
+        `
+        SELECT TOP (@p4)
+          member.Member_ID AS member_id,
+          member.External_ID AS external_id,
+          member.Member_Number AS member_number,
+          member.Member_Name AS member_name,
+          member.Status AS status,
+          member.Effective_From AS effective_from,
+          member.Effective_To AS effective_to,
+
+          member.Member_Address AS member_address,
+          member.Member_City AS member_city,
+          member.Member_State AS member_state,
+          member.Member_Zip AS member_zip,
+
+          member.Ship_To_Name AS ship_to_name,
+          member.Ship_To_Address AS ship_to_address,
+          member.Ship_To_City AS ship_to_city,
+          member.Ship_To_State AS ship_to_state,
+          member.Ship_To_Zip AS ship_to_zip
+
+        FROM dbo.Ref_Member member
+
+        WHERE
+          /*
+           * Exact Member Number.
+           */
+          LTRIM(RTRIM(COALESCE(member.Member_Number, ''))) = @p1
+
+          /*
+           * Member Number with leading-zero normalization.
+           *
+           * Examples:
+           *   Search 5      matches 000005
+           *   Search 2315   matches 002315
+           */
+          OR
+          (
+            TRY_CONVERT(
+              BIGINT,
+              LTRIM(RTRIM(member.Member_Number))
+            ) IS NOT NULL
+
+            AND TRY_CONVERT(
+              BIGINT,
+              LTRIM(RTRIM(@p1))
+            ) IS NOT NULL
+
+            AND TRY_CONVERT(
+              BIGINT,
+              LTRIM(RTRIM(member.Member_Number))
+            ) = TRY_CONVERT(
+              BIGINT,
+              LTRIM(RTRIM(@p1))
+            )
+          )
+
+          /*
+           * Partial Member Number.
+           */
+          OR LTRIM(
+               RTRIM(
+                 COALESCE(member.Member_Number, '')
+               )
+             ) LIKE @p2
+
+          /*
+           * Partial Member Name.
+           */
+          OR LTRIM(
+               RTRIM(
+                 COALESCE(member.Member_Name, '')
+               )
+             ) LIKE @p2
+
+        ORDER BY
+          /*
+           * 1. Exact Member Number.
+           */
+          CASE
+            WHEN LTRIM(
+                   RTRIM(
+                     COALESCE(member.Member_Number, '')
+                   )
+                 ) = @p1
+              THEN 0
+            ELSE 1
+          END,
+
+          /*
+           * 2. Leading-zero normalized exact match.
+           */
+          CASE
+            WHEN
+              TRY_CONVERT(
+                BIGINT,
+                LTRIM(RTRIM(member.Member_Number))
+              ) IS NOT NULL
+
+              AND TRY_CONVERT(
+                BIGINT,
+                LTRIM(RTRIM(@p1))
+              ) IS NOT NULL
+
+              AND TRY_CONVERT(
+                BIGINT,
+                LTRIM(RTRIM(member.Member_Number))
+              ) = TRY_CONVERT(
+                BIGINT,
+                LTRIM(RTRIM(@p1))
+              )
+              THEN 0
+            ELSE 1
+          END,
+
+          /*
+           * 3. Member Number beginning with the search value.
+           */
+          CASE
+            WHEN LTRIM(
+                   RTRIM(
+                     COALESCE(member.Member_Number, '')
+                   )
+                 ) LIKE @p3
+              THEN 0
+            ELSE 1
+          END,
+
+          /*
+           * 4. Current or continuing records first.
+           */
+          CASE
+            WHEN member.Effective_To IS NULL
+              THEN 0
+            WHEN member.Effective_To >= CAST(GETUTCDATE() AS DATE)
+              THEN 1
+            ELSE 2
+          END,
+
+          /*
+           * 5. Newest effective record.
+           */
+          member.Effective_To DESC,
+          member.Effective_From DESC,
+
+          member.Member_Number,
+          member.Member_Name;
+        `,
+        [searchValue, containsSearch, startsWithSearch, limit],
+      );
+
+      const items = (rows || []).map((member) => ({
+        member_id: member.member_id || null,
+        external_id: member.external_id || null,
+
+        member_number: String(member.member_number || "").trim(),
+        member_name: String(member.member_name || "").trim(),
+
+        status: member.status || null,
+        effective_from: member.effective_from || null,
+        effective_to: member.effective_to || null,
+
+        member_address: member.member_address || null,
+        member_city: member.member_city || null,
+        member_state: member.member_state || null,
+        member_zip: member.member_zip || null,
+
+        ship_to_name: member.ship_to_name || null,
+        ship_to_address: member.ship_to_address || null,
+        ship_to_city: member.ship_to_city || null,
+        ship_to_state: member.ship_to_state || null,
+        ship_to_zip: member.ship_to_zip || null,
+      }));
+
+      return res.status(200).json({
+        success: true,
+        count: items.length,
+        items,
+      });
+    } catch (error) {
+      console.error("❌ GET /reports/member-lookup error:", error);
+
+      return sendRouteError(res, next, error);
+    }
+  },
+);
+
+/* ======================================================================
    REPORT SUMMARY
 ====================================================================== */
 /* ======================================================================
