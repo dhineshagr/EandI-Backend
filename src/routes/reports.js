@@ -255,6 +255,7 @@ const editableDetailFields = new Set([
   "member_city",
   "member_state",
   "member_zip",
+  "matched_member_number",
   "po",
   "invoice",
   "invoice_date",
@@ -1110,6 +1111,15 @@ router.get(
 /* ======================================================================
    UPDATE SINGLE FIELD + AUDIT
 ====================================================================== */
+/* ======================================================================
+   UPDATE SINGLE FIELD + AUDIT
+
+   Special behavior:
+   - Editing Matched_Member_Number looks up Ref_Member.
+   - Automatically populates Matched_Member_Name.
+   - Original Member_Number and Member_Name remain unchanged.
+====================================================================== */
+
 router.put(
   "/reports/:reportNumber/row/:curDetailId",
   requireAuth,
@@ -1117,27 +1127,316 @@ router.put(
     try {
       const rn = asInt(req.params.reportNumber);
       const curDetailId = asInt(req.params.curDetailId);
+
       const fieldName = String(req.body?.field_name || "")
         .trim()
         .toLowerCase();
+
       const { new_value, reason } = req.body || {};
 
-      if (!rn) return res.status(400).json({ error: "Invalid report number" });
-      if (!curDetailId)
-        return res.status(400).json({ error: "Invalid detail row ID" });
-      if (!fieldName)
-        return res.status(400).json({ error: "field_name required" });
+      if (!rn) {
+        return res.status(400).json({
+          error: "Invalid report number",
+        });
+      }
+
+      if (!curDetailId) {
+        return res.status(400).json({
+          error: "Invalid detail row ID",
+        });
+      }
+
+      if (!fieldName) {
+        return res.status(400).json({
+          error: "field_name required",
+        });
+      }
+
       if (!editableDetailFields.has(fieldName)) {
-        return res.status(400).json({ error: "Invalid or read-only field" });
+        return res.status(400).json({
+          error: "Invalid or read-only field",
+        });
       }
 
       await verifyReportAccess(req, rn);
 
+      const changedBy = getCurrentUserIdentifier(req);
+
       const result = await withTransaction(async (txQuery) => {
+        /*
+         * Special processing for selected matched member.
+         */
+        if (fieldName === "matched_member_number") {
+          const selectedMemberNumber = String(new_value ?? "").trim();
+
+          const { rows: currentRows } = await txQuery(
+            `
+            SELECT
+              Matched_Member_Number AS matched_member_number,
+              Matched_Member_Name AS matched_member_name
+            FROM dbo.Cur_Invoice_Detail
+            WHERE Cur_Detail_ID = @p1
+              AND Report_Number = @p2;
+            `,
+            [curDetailId, rn],
+          );
+
+          if (!currentRows.length) {
+            const error = new Error("Row not found");
+            error.statusCode = 404;
+            error.code = "DETAIL_ROW_NOT_FOUND";
+            throw error;
+          }
+
+          const oldMatchedNumber = currentRows[0].matched_member_number ?? "";
+
+          const oldMatchedName = currentRows[0].matched_member_name ?? "";
+
+          /*
+           * Clearing the selected member clears both matched values.
+           */
+          if (!selectedMemberNumber) {
+            const { rows: clearedRows } = await txQuery(
+              `
+              UPDATE dbo.Cur_Invoice_Detail
+              SET
+                Matched_Member_Number = NULL,
+                Matched_Member_Name = NULL,
+                Updated_At_UTC = GETUTCDATE()
+              OUTPUT INSERTED.*
+              WHERE Cur_Detail_ID = @p1
+                AND Report_Number = @p2;
+              `,
+              [curDetailId, rn],
+            );
+
+            await txQuery(
+              `
+              INSERT INTO dbo.Audit_Log
+              (
+                Report_Number,
+                Row_Key,
+                Field_Name,
+                Old_Value,
+                New_Value,
+                Changed_By,
+                Change_Reason,
+                Changed_At_UTC
+              )
+              VALUES
+              (
+                @p1,
+                @p2,
+                'matched_member_number',
+                @p3,
+                '',
+                @p4,
+                @p5,
+                GETUTCDATE()
+              );
+              `,
+              [
+                rn,
+                curDetailId,
+                String(oldMatchedNumber),
+                changedBy,
+                reason || "Matched member selection cleared",
+              ],
+            );
+
+            await txQuery(
+              `
+              INSERT INTO dbo.Audit_Log
+              (
+                Report_Number,
+                Row_Key,
+                Field_Name,
+                Old_Value,
+                New_Value,
+                Changed_By,
+                Change_Reason,
+                Changed_At_UTC
+              )
+              VALUES
+              (
+                @p1,
+                @p2,
+                'matched_member_name',
+                @p3,
+                '',
+                @p4,
+                @p5,
+                GETUTCDATE()
+              );
+              `,
+              [
+                rn,
+                curDetailId,
+                String(oldMatchedName),
+                changedBy,
+                reason || "Matched member selection cleared",
+              ],
+            );
+
+            return clearedRows[0];
+          }
+
+          /*
+           * Normalize leading zeros when matching.
+           *
+           * Examples:
+           *   000145 matches 145
+           *   002315 matches 2315
+           */
+          const { rows: memberRows } = await txQuery(
+            `
+            SELECT TOP 1
+              Member_Number AS member_number,
+              Member_Name AS member_name
+            FROM dbo.Ref_Member
+            WHERE
+              LTRIM(RTRIM(Member_Number)) = @p1
+
+              OR
+              (
+                TRY_CONVERT(BIGINT, LTRIM(RTRIM(Member_Number)))
+                  IS NOT NULL
+
+                AND TRY_CONVERT(BIGINT, LTRIM(RTRIM(@p1)))
+                  IS NOT NULL
+
+                AND TRY_CONVERT(BIGINT, LTRIM(RTRIM(Member_Number)))
+                  = TRY_CONVERT(BIGINT, LTRIM(RTRIM(@p1)))
+              )
+            ORDER BY
+              CASE
+                WHEN LTRIM(RTRIM(Member_Number)) = @p1
+                  THEN 0
+                ELSE 1
+              END,
+              Effective_To DESC,
+              Effective_From DESC;
+            `,
+            [selectedMemberNumber],
+          );
+
+          if (!memberRows.length) {
+            const error = new Error(
+              `Member Number '${selectedMemberNumber}' was not found.`,
+            );
+
+            error.statusCode = 400;
+            error.code = "MATCHED_MEMBER_NOT_FOUND";
+
+            throw error;
+          }
+
+          const matchedMemberNumber = String(
+            memberRows[0].member_number || selectedMemberNumber,
+          ).trim();
+
+          const matchedMemberName = String(
+            memberRows[0].member_name || "",
+          ).trim();
+
+          const { rows: updatedRows } = await txQuery(
+            `
+            UPDATE dbo.Cur_Invoice_Detail
+            SET
+              Matched_Member_Number = @p1,
+              Matched_Member_Name = @p2,
+              Updated_At_UTC = GETUTCDATE()
+            OUTPUT INSERTED.*
+            WHERE Cur_Detail_ID = @p3
+              AND Report_Number = @p4;
+            `,
+            [matchedMemberNumber, matchedMemberName || null, curDetailId, rn],
+          );
+
+          await txQuery(
+            `
+            INSERT INTO dbo.Audit_Log
+            (
+              Report_Number,
+              Row_Key,
+              Field_Name,
+              Old_Value,
+              New_Value,
+              Changed_By,
+              Change_Reason,
+              Changed_At_UTC
+            )
+            VALUES
+            (
+              @p1,
+              @p2,
+              'matched_member_number',
+              @p3,
+              @p4,
+              @p5,
+              @p6,
+              GETUTCDATE()
+            );
+            `,
+            [
+              rn,
+              curDetailId,
+              String(oldMatchedNumber),
+              matchedMemberNumber,
+              changedBy,
+              reason || "Matched member selected",
+            ],
+          );
+
+          await txQuery(
+            `
+            INSERT INTO dbo.Audit_Log
+            (
+              Report_Number,
+              Row_Key,
+              Field_Name,
+              Old_Value,
+              New_Value,
+              Changed_By,
+              Change_Reason,
+              Changed_At_UTC
+            )
+            VALUES
+            (
+              @p1,
+              @p2,
+              'matched_member_name',
+              @p3,
+              @p4,
+              @p5,
+              @p6,
+              GETUTCDATE()
+            );
+            `,
+            [
+              rn,
+              curDetailId,
+              String(oldMatchedName),
+              matchedMemberName,
+              changedBy,
+              reason || "Matched member name populated automatically",
+            ],
+          );
+
+          return updatedRows[0];
+        }
+
+        /*
+         * Existing generic field-update logic.
+         */
         const { rows: oldRows } = await txQuery(
-          `SELECT CAST(${fieldName} AS NVARCHAR(MAX)) AS old_value
-           FROM dbo.Cur_Invoice_Detail
-           WHERE Cur_Detail_ID=@p1 AND Report_Number=@p2;`,
+          `
+          SELECT
+            CAST(${fieldName} AS NVARCHAR(MAX)) AS old_value
+          FROM dbo.Cur_Invoice_Detail
+          WHERE Cur_Detail_ID = @p1
+            AND Report_Number = @p2;
+          `,
           [curDetailId, rn],
         );
 
@@ -1149,25 +1448,50 @@ router.put(
         }
 
         const { rows: updatedRows } = await txQuery(
-          `UPDATE dbo.Cur_Invoice_Detail
-           SET ${fieldName}=@p1, Updated_At_UTC=GETUTCDATE()
-           OUTPUT INSERTED.*
-           WHERE Cur_Detail_ID=@p2 AND Report_Number=@p3;`,
+          `
+          UPDATE dbo.Cur_Invoice_Detail
+          SET
+            ${fieldName} = @p1,
+            Updated_At_UTC = GETUTCDATE()
+          OUTPUT INSERTED.*
+          WHERE Cur_Detail_ID = @p2
+            AND Report_Number = @p3;
+          `,
           [new_value, curDetailId, rn],
         );
 
         await txQuery(
-          `INSERT INTO dbo.Audit_Log
-           (Report_Number, Row_Key, Field_Name, Old_Value, New_Value,
-            Changed_By, Change_Reason, Changed_At_UTC)
-           VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,GETUTCDATE());`,
+          `
+          INSERT INTO dbo.Audit_Log
+          (
+            Report_Number,
+            Row_Key,
+            Field_Name,
+            Old_Value,
+            New_Value,
+            Changed_By,
+            Change_Reason,
+            Changed_At_UTC
+          )
+          VALUES
+          (
+            @p1,
+            @p2,
+            @p3,
+            @p4,
+            @p5,
+            @p6,
+            @p7,
+            GETUTCDATE()
+          );
+          `,
           [
             rn,
             curDetailId,
             fieldName,
             oldRows[0].old_value,
             String(new_value ?? ""),
-            getCurrentUserIdentifier(req),
+            changedBy,
             reason || "Manual correction",
           ],
         );
@@ -1175,9 +1499,13 @@ router.put(
         return updatedRows[0];
       });
 
-      return res.json({ ok: true, row: result });
+      return res.json({
+        ok: true,
+        row: result,
+      });
     } catch (error) {
       console.error("❌ UPDATE row error:", error);
+
       return sendRouteError(res, next, error);
     }
   },
