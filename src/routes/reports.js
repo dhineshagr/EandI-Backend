@@ -4044,6 +4044,14 @@ router.post(
 
 /* ======================================================================
    PUT /reports/accounting-periods/:period/lock
+
+   CLIENT REQUIREMENT
+   ----------------------------------------------------------------------
+   - Lock current accounting period.
+   - Require reason.
+   - Preserve current Accounting_Period status fields.
+   - Create permanent LOCK audit-history record.
+   - Continue writing existing Users_Audit_Log record.
 ====================================================================== */
 
 router.put(
@@ -4053,141 +4061,329 @@ router.put(
   async (req, res, next) => {
     try {
       const period = normalizeAccountingPeriod(req.params?.period);
+
       const lockedBy = getCurrentUserIdentifier(req);
+
+      const reason = String(req.body?.reason || "").trim();
+
+      /* ================================================================
+         VALIDATE PERIOD
+      ================================================================ */
 
       if (!period) {
         return res.status(400).json({
           success: false,
+
           code: "INVALID_ACCOUNTING_PERIOD",
+
           message: "Accounting period must use YYYY-MM format.",
         });
       }
 
-      /*
-       * Update only when the period exists and is currently open.
-       *
-       * This condition makes the operation safe when two users
-       * try to lock the same period at the same time.
-       */
-      const { rows: updatedRows } = await query(
-        `
-        UPDATE dbo.Accounting_Period
-        SET
-          Is_Locked = 1,
-          Locked_By = @p2,
-          Locked_At_UTC = GETUTCDATE(),
-          Unlocked_By = NULL,
-          Unlocked_At_UTC = NULL,
-          Updated_At_UTC = GETUTCDATE()
-        OUTPUT
-          INSERTED.Accounting_Period_ID AS accounting_period_id,
-          INSERTED.Period AS period,
-          INSERTED.Is_Locked AS is_locked,
-          INSERTED.Locked_By AS locked_by,
-          INSERTED.Locked_At_UTC AS locked_at_utc,
-          INSERTED.Unlocked_By AS unlocked_by,
-          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
-          INSERTED.Created_At_UTC AS created_at_utc,
-          INSERTED.Updated_At_UTC AS updated_at_utc
-        WHERE Period = @p1
-          AND Is_Locked = 0;
-        `,
-        [period, lockedBy],
-      );
+      /* ================================================================
+         VALIDATE REASON
+      ================================================================ */
 
-      if (updatedRows.length === 0) {
-        const { rows: existingRows } = await query(
-          `
-          SELECT
-            Accounting_Period_ID AS accounting_period_id,
-            Period AS period,
-            Is_Locked AS is_locked,
-            Locked_By AS locked_by,
-            Locked_At_UTC AS locked_at_utc
-          FROM dbo.Accounting_Period
-          WHERE Period = @p1;
-          `,
-          [period],
-        );
-
-        if (existingRows.length === 0) {
-          return res.status(404).json({
-            success: false,
-            code: "ACCOUNTING_PERIOD_NOT_FOUND",
-            message: `Accounting period ${period} is not configured.`,
-          });
-        }
-
-        const existingPeriod = existingRows[0];
-
-        return res.status(409).json({
+      if (!reason) {
+        return res.status(400).json({
           success: false,
-          code: "ACCOUNTING_PERIOD_ALREADY_LOCKED",
-          message: `Accounting period ${period} is already locked.`,
-          period: {
-            accounting_period_id: existingPeriod.accounting_period_id,
-            period: existingPeriod.period,
-            is_locked: true,
-            status: "closed",
-            locked_by: existingPeriod.locked_by || null,
-            locked_at_utc: existingPeriod.locked_at_utc || null,
-          },
+
+          code: "ACCOUNTING_PERIOD_REASON_REQUIRED",
+
+          message: "A reason is required to lock an accounting period.",
         });
       }
 
-      const row = updatedRows[0];
+      if (reason.length > 500) {
+        return res.status(400).json({
+          success: false,
 
-      /*
-       * Audit failure should not fail the lock operation.
-       */
-      try {
-        await query(
-          `
-          INSERT INTO dbo.Users_Audit_Log
-          (
-            User_Email,
-            Action,
-            Context_JSON,
-            Created_At_UTC
-          )
-          VALUES
-          (
-            @p1,
-            'lock_accounting_period',
-            @p2,
-            GETUTCDATE()
-          );
-          `,
-          [
-            lockedBy,
-            JSON.stringify({
-              period,
-              status: "closed",
-              locked_by: lockedBy,
-            }),
-          ],
-        );
-      } catch (auditError) {
-        console.warn(
-          "Lock accounting period audit log skipped:",
-          auditError.message,
-        );
+          code: "ACCOUNTING_PERIOD_REASON_TOO_LONG",
+
+          message: "Lock reason cannot exceed 500 characters.",
+        });
       }
+
+      /* ================================================================
+         TRANSACTION
+      ================================================================ */
+
+      const result = await withTransaction(async (txQuery) => {
+        /* ----------------------------------------------------------
+               LOCK PERIOD
+
+               Update only if currently open.
+            ---------------------------------------------------------- */
+
+        const { rows: updatedRows } = await txQuery(
+          `
+              UPDATE dbo.Accounting_Period
+
+              SET
+                Is_Locked = 1,
+
+                Locked_By = @p2,
+
+                Locked_At_UTC =
+                  GETUTCDATE(),
+
+                /*
+                 * Existing behavior preserved.
+                 * Clear previous unlock fields when period is locked again.
+                 */
+                Unlocked_By = NULL,
+
+                Unlocked_At_UTC = NULL,
+
+                Updated_At_UTC =
+                  GETUTCDATE()
+
+              OUTPUT
+                INSERTED.Accounting_Period_ID
+                  AS accounting_period_id,
+
+                INSERTED.Period
+                  AS period,
+
+                INSERTED.Is_Locked
+                  AS is_locked,
+
+                INSERTED.Locked_By
+                  AS locked_by,
+
+                INSERTED.Locked_At_UTC
+                  AS locked_at_utc,
+
+                INSERTED.Unlocked_By
+                  AS unlocked_by,
+
+                INSERTED.Unlocked_At_UTC
+                  AS unlocked_at_utc,
+
+                INSERTED.Created_At_UTC
+                  AS created_at_utc,
+
+                INSERTED.Updated_At_UTC
+                  AS updated_at_utc
+
+              WHERE
+                Period = @p1
+
+                AND Is_Locked = 0;
+              `,
+          [period, lockedBy],
+        );
+
+        /* ----------------------------------------------------------
+               NOT UPDATED
+            ---------------------------------------------------------- */
+
+        if (updatedRows.length === 0) {
+          const { rows: existingRows } = await txQuery(
+            `
+                SELECT
+                  Accounting_Period_ID
+                    AS accounting_period_id,
+
+                  Period
+                    AS period,
+
+                  Is_Locked
+                    AS is_locked,
+
+                  Locked_By
+                    AS locked_by,
+
+                  Locked_At_UTC
+                    AS locked_at_utc
+
+                FROM dbo.Accounting_Period
+
+                WHERE
+                  Period = @p1;
+                `,
+            [period],
+          );
+
+          if (existingRows.length === 0) {
+            const error = new Error(
+              `Accounting period ${period} is not configured.`,
+            );
+
+            error.statusCode = 404;
+
+            error.code = "ACCOUNTING_PERIOD_NOT_FOUND";
+
+            throw error;
+          }
+
+          const existingPeriod = existingRows[0];
+
+          if (Boolean(existingPeriod.is_locked)) {
+            const error = new Error(
+              `Accounting period ${period} is already locked.`,
+            );
+
+            error.statusCode = 409;
+
+            error.code = "ACCOUNTING_PERIOD_ALREADY_LOCKED";
+
+            error.period = existingPeriod;
+
+            throw error;
+          }
+
+          const error = new Error(
+            `Unable to lock accounting period ${period}.`,
+          );
+
+          error.statusCode = 409;
+
+          error.code = "ACCOUNTING_PERIOD_LOCK_FAILED";
+
+          throw error;
+        }
+
+        const row = updatedRows[0];
+
+        /* ==========================================================
+               PERMANENT ACCOUNTING PERIOD AUDIT HISTORY
+            ========================================================== */
+
+        await txQuery(
+          `
+              INSERT INTO dbo.Accounting_Period_Audit
+              (
+                Accounting_Period_ID,
+
+                Period,
+
+                Action,
+
+                Reason,
+
+                Changed_By,
+
+                Changed_At_UTC
+              )
+
+              VALUES
+              (
+                @p1,
+
+                @p2,
+
+                'LOCK',
+
+                @p3,
+
+                @p4,
+
+                GETUTCDATE()
+              );
+              `,
+          [row.accounting_period_id, period, reason, lockedBy],
+        );
+
+        /* ==========================================================
+               EXISTING USERS AUDIT LOG
+            ========================================================== */
+
+        try {
+          await txQuery(
+            `
+                INSERT INTO dbo.Users_Audit_Log
+                (
+                  User_Email,
+
+                  Action,
+
+                  Context_JSON,
+
+                  Created_At_UTC
+                )
+
+                VALUES
+                (
+                  @p1,
+
+                  'lock_accounting_period',
+
+                  @p2,
+
+                  GETUTCDATE()
+                );
+                `,
+            [
+              lockedBy,
+
+              JSON.stringify({
+                period,
+
+                status: "closed",
+
+                action: "LOCK",
+
+                reason,
+
+                locked_by: lockedBy,
+              }),
+            ],
+          );
+        } catch (auditError) {
+          /*
+           * Preserve your existing behavior:
+           * Users_Audit_Log failure should not fail the period action.
+           *
+           * Accounting_Period_Audit above is the required business
+           * history and is part of the transaction.
+           */
+          console.warn(
+            "Users audit log for accounting-period lock skipped:",
+            auditError.message,
+          );
+        }
+
+        return row;
+      });
+
+      /* ================================================================
+         RESPONSE
+      ================================================================ */
 
       return res.status(200).json({
         success: true,
+
         message: `Accounting period ${period} was locked successfully.`,
+
         period: {
-          accounting_period_id: row.accounting_period_id,
-          period: row.period,
+          accounting_period_id: result.accounting_period_id,
+
+          period: result.period,
+
           is_locked: true,
+
           status: "closed",
-          locked_by: row.locked_by || null,
-          locked_at_utc: row.locked_at_utc || null,
-          unlocked_by: row.unlocked_by || null,
-          unlocked_at_utc: row.unlocked_at_utc || null,
-          created_at_utc: row.created_at_utc || null,
-          updated_at_utc: row.updated_at_utc || null,
+
+          locked_by: result.locked_by || null,
+
+          locked_at_utc: result.locked_at_utc || null,
+
+          unlocked_by: result.unlocked_by || null,
+
+          unlocked_at_utc: result.unlocked_at_utc || null,
+
+          created_at_utc: result.created_at_utc || null,
+
+          updated_at_utc: result.updated_at_utc || null,
+        },
+
+        audit: {
+          action: "LOCK",
+
+          reason,
+
+          changed_by: lockedBy,
         },
       });
     } catch (error) {
@@ -4196,6 +4392,35 @@ router.put(
         error,
       );
 
+      /*
+       * Preserve clean HTTP errors created above.
+       */
+      if (error?.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+
+          code: error.code || "ACCOUNTING_PERIOD_LOCK_FAILED",
+
+          message: error.message,
+
+          period: error.period
+            ? {
+                accounting_period_id: error.period.accounting_period_id,
+
+                period: error.period.period,
+
+                is_locked: Boolean(error.period.is_locked),
+
+                status: Boolean(error.period.is_locked) ? "closed" : "open",
+
+                locked_by: error.period.locked_by || null,
+
+                locked_at_utc: error.period.locked_at_utc || null,
+              }
+            : undefined,
+        });
+      }
+
       next(error);
     }
   },
@@ -4203,6 +4428,14 @@ router.put(
 
 /* ======================================================================
    PUT /reports/accounting-periods/:period/unlock
+
+   CLIENT REQUIREMENT
+   ----------------------------------------------------------------------
+   - Unlock current accounting period.
+   - Require reason.
+   - Preserve current Accounting_Period state.
+   - Create permanent UNLOCK audit-history record.
+   - Continue existing Users_Audit_Log behavior.
 ====================================================================== */
 
 router.put(
@@ -4212,136 +4445,314 @@ router.put(
   async (req, res, next) => {
     try {
       const period = normalizeAccountingPeriod(req.params?.period);
+
       const unlockedBy = getCurrentUserIdentifier(req);
+
+      const reason = String(req.body?.reason || "").trim();
+
+      /* ================================================================
+         VALIDATE PERIOD
+      ================================================================ */
 
       if (!period) {
         return res.status(400).json({
           success: false,
+
           code: "INVALID_ACCOUNTING_PERIOD",
+
           message: "Accounting period must use YYYY-MM format.",
         });
       }
 
-      /*
-       * Update only when the period exists and is currently locked.
-       */
-      const { rows: updatedRows } = await query(
-        `
-        UPDATE dbo.Accounting_Period
-        SET
-          Is_Locked = 0,
-          Unlocked_By = @p2,
-          Unlocked_At_UTC = GETUTCDATE(),
-          Updated_At_UTC = GETUTCDATE()
-        OUTPUT
-          INSERTED.Accounting_Period_ID AS accounting_period_id,
-          INSERTED.Period AS period,
-          INSERTED.Is_Locked AS is_locked,
-          INSERTED.Locked_By AS locked_by,
-          INSERTED.Locked_At_UTC AS locked_at_utc,
-          INSERTED.Unlocked_By AS unlocked_by,
-          INSERTED.Unlocked_At_UTC AS unlocked_at_utc,
-          INSERTED.Created_At_UTC AS created_at_utc,
-          INSERTED.Updated_At_UTC AS updated_at_utc
-        WHERE Period = @p1
-          AND Is_Locked = 1;
-        `,
-        [period, unlockedBy],
-      );
+      /* ================================================================
+         VALIDATE REASON
+      ================================================================ */
 
-      if (updatedRows.length === 0) {
-        const { rows: existingRows } = await query(
-          `
-          SELECT
-            Accounting_Period_ID AS accounting_period_id,
-            Period AS period,
-            Is_Locked AS is_locked,
-            Unlocked_By AS unlocked_by,
-            Unlocked_At_UTC AS unlocked_at_utc
-          FROM dbo.Accounting_Period
-          WHERE Period = @p1;
-          `,
-          [period],
-        );
-
-        if (existingRows.length === 0) {
-          return res.status(404).json({
-            success: false,
-            code: "ACCOUNTING_PERIOD_NOT_FOUND",
-            message: `Accounting period ${period} is not configured.`,
-          });
-        }
-
-        const existingPeriod = existingRows[0];
-
-        return res.status(409).json({
+      if (!reason) {
+        return res.status(400).json({
           success: false,
-          code: "ACCOUNTING_PERIOD_ALREADY_OPEN",
-          message: `Accounting period ${period} is already open.`,
-          period: {
-            accounting_period_id: existingPeriod.accounting_period_id,
-            period: existingPeriod.period,
-            is_locked: false,
-            status: "open",
-            unlocked_by: existingPeriod.unlocked_by || null,
-            unlocked_at_utc: existingPeriod.unlocked_at_utc || null,
-          },
+
+          code: "ACCOUNTING_PERIOD_REASON_REQUIRED",
+
+          message: "A reason is required to unlock an accounting period.",
         });
       }
 
-      const row = updatedRows[0];
+      if (reason.length > 500) {
+        return res.status(400).json({
+          success: false,
 
-      /*
-       * Audit failure should not fail the unlock operation.
-       */
-      try {
-        await query(
-          `
-          INSERT INTO dbo.Users_Audit_Log
-          (
-            User_Email,
-            Action,
-            Context_JSON,
-            Created_At_UTC
-          )
-          VALUES
-          (
-            @p1,
-            'unlock_accounting_period',
-            @p2,
-            GETUTCDATE()
-          );
-          `,
-          [
-            unlockedBy,
-            JSON.stringify({
-              period,
-              status: "open",
-              unlocked_by: unlockedBy,
-            }),
-          ],
-        );
-      } catch (auditError) {
-        console.warn(
-          "Unlock accounting period audit log skipped:",
-          auditError.message,
-        );
+          code: "ACCOUNTING_PERIOD_REASON_TOO_LONG",
+
+          message: "Unlock reason cannot exceed 500 characters.",
+        });
       }
+
+      /* ================================================================
+         TRANSACTION
+      ================================================================ */
+
+      const result = await withTransaction(async (txQuery) => {
+        /* ----------------------------------------------------------
+               UNLOCK
+
+               Update only if currently locked.
+            ---------------------------------------------------------- */
+
+        const { rows: updatedRows } = await txQuery(
+          `
+              UPDATE dbo.Accounting_Period
+
+              SET
+                Is_Locked = 0,
+
+                Unlocked_By = @p2,
+
+                Unlocked_At_UTC =
+                  GETUTCDATE(),
+
+                Updated_At_UTC =
+                  GETUTCDATE()
+
+              OUTPUT
+                INSERTED.Accounting_Period_ID
+                  AS accounting_period_id,
+
+                INSERTED.Period
+                  AS period,
+
+                INSERTED.Is_Locked
+                  AS is_locked,
+
+                INSERTED.Locked_By
+                  AS locked_by,
+
+                INSERTED.Locked_At_UTC
+                  AS locked_at_utc,
+
+                INSERTED.Unlocked_By
+                  AS unlocked_by,
+
+                INSERTED.Unlocked_At_UTC
+                  AS unlocked_at_utc,
+
+                INSERTED.Created_At_UTC
+                  AS created_at_utc,
+
+                INSERTED.Updated_At_UTC
+                  AS updated_at_utc
+
+              WHERE
+                Period = @p1
+
+                AND Is_Locked = 1;
+              `,
+          [period, unlockedBy],
+        );
+
+        /* ----------------------------------------------------------
+               NOT UPDATED
+            ---------------------------------------------------------- */
+
+        if (updatedRows.length === 0) {
+          const { rows: existingRows } = await txQuery(
+            `
+                SELECT
+                  Accounting_Period_ID
+                    AS accounting_period_id,
+
+                  Period
+                    AS period,
+
+                  Is_Locked
+                    AS is_locked,
+
+                  Unlocked_By
+                    AS unlocked_by,
+
+                  Unlocked_At_UTC
+                    AS unlocked_at_utc
+
+                FROM dbo.Accounting_Period
+
+                WHERE
+                  Period = @p1;
+                `,
+            [period],
+          );
+
+          if (existingRows.length === 0) {
+            const error = new Error(
+              `Accounting period ${period} is not configured.`,
+            );
+
+            error.statusCode = 404;
+
+            error.code = "ACCOUNTING_PERIOD_NOT_FOUND";
+
+            throw error;
+          }
+
+          const existingPeriod = existingRows[0];
+
+          if (!Boolean(existingPeriod.is_locked)) {
+            const error = new Error(
+              `Accounting period ${period} is already open.`,
+            );
+
+            error.statusCode = 409;
+
+            error.code = "ACCOUNTING_PERIOD_ALREADY_OPEN";
+
+            error.period = existingPeriod;
+
+            throw error;
+          }
+
+          const error = new Error(
+            `Unable to unlock accounting period ${period}.`,
+          );
+
+          error.statusCode = 409;
+
+          error.code = "ACCOUNTING_PERIOD_UNLOCK_FAILED";
+
+          throw error;
+        }
+
+        const row = updatedRows[0];
+
+        /* ==========================================================
+               PERMANENT ACCOUNTING PERIOD AUDIT HISTORY
+            ========================================================== */
+
+        await txQuery(
+          `
+              INSERT INTO dbo.Accounting_Period_Audit
+              (
+                Accounting_Period_ID,
+
+                Period,
+
+                Action,
+
+                Reason,
+
+                Changed_By,
+
+                Changed_At_UTC
+              )
+
+              VALUES
+              (
+                @p1,
+
+                @p2,
+
+                'UNLOCK',
+
+                @p3,
+
+                @p4,
+
+                GETUTCDATE()
+              );
+              `,
+          [row.accounting_period_id, period, reason, unlockedBy],
+        );
+
+        /* ==========================================================
+               EXISTING USERS AUDIT LOG
+            ========================================================== */
+
+        try {
+          await txQuery(
+            `
+                INSERT INTO dbo.Users_Audit_Log
+                (
+                  User_Email,
+
+                  Action,
+
+                  Context_JSON,
+
+                  Created_At_UTC
+                )
+
+                VALUES
+                (
+                  @p1,
+
+                  'unlock_accounting_period',
+
+                  @p2,
+
+                  GETUTCDATE()
+                );
+                `,
+            [
+              unlockedBy,
+
+              JSON.stringify({
+                period,
+
+                status: "open",
+
+                action: "UNLOCK",
+
+                reason,
+
+                unlocked_by: unlockedBy,
+              }),
+            ],
+          );
+        } catch (auditError) {
+          console.warn(
+            "Users audit log for accounting-period unlock skipped:",
+            auditError.message,
+          );
+        }
+
+        return row;
+      });
+
+      /* ================================================================
+         RESPONSE
+      ================================================================ */
 
       return res.status(200).json({
         success: true,
+
         message: `Accounting period ${period} was unlocked successfully.`,
+
         period: {
-          accounting_period_id: row.accounting_period_id,
-          period: row.period,
+          accounting_period_id: result.accounting_period_id,
+
+          period: result.period,
+
           is_locked: false,
+
           status: "open",
-          locked_by: row.locked_by || null,
-          locked_at_utc: row.locked_at_utc || null,
-          unlocked_by: row.unlocked_by || null,
-          unlocked_at_utc: row.unlocked_at_utc || null,
-          created_at_utc: row.created_at_utc || null,
-          updated_at_utc: row.updated_at_utc || null,
+
+          locked_by: result.locked_by || null,
+
+          locked_at_utc: result.locked_at_utc || null,
+
+          unlocked_by: result.unlocked_by || null,
+
+          unlocked_at_utc: result.unlocked_at_utc || null,
+
+          created_at_utc: result.created_at_utc || null,
+
+          updated_at_utc: result.updated_at_utc || null,
+        },
+
+        audit: {
+          action: "UNLOCK",
+
+          reason,
+
+          changed_by: unlockedBy,
         },
       });
     } catch (error) {
@@ -4349,6 +4760,32 @@ router.put(
         `❌ PUT /reports/accounting-periods/${req.params?.period}/unlock error:`,
         error,
       );
+
+      if (error?.statusCode) {
+        return res.status(error.statusCode).json({
+          success: false,
+
+          code: error.code || "ACCOUNTING_PERIOD_UNLOCK_FAILED",
+
+          message: error.message,
+
+          period: error.period
+            ? {
+                accounting_period_id: error.period.accounting_period_id,
+
+                period: error.period.period,
+
+                is_locked: Boolean(error.period.is_locked),
+
+                status: Boolean(error.period.is_locked) ? "closed" : "open",
+
+                unlocked_by: error.period.unlocked_by || null,
+
+                unlocked_at_utc: error.period.unlocked_at_utc || null,
+              }
+            : undefined,
+        });
+      }
 
       next(error);
     }
@@ -4867,6 +5304,123 @@ router.get(
     } catch (error) {
       console.error("❌ GET /report-delete-audit error:", error);
       return sendRouteError(res, next, error);
+    }
+  },
+);
+
+/* ======================================================================
+   GET /reports/accounting-periods/history
+
+   CLIENT REQUIREMENT
+   ----------------------------------------------------------------------
+   - Keep every lock/unlock event.
+   - Show approximately the prior two years.
+   - Newest events first.
+
+   Query:
+     /reports/accounting-periods/history?years=2
+====================================================================== */
+
+router.get(
+  "/reports/accounting-periods/history",
+  requireAuth,
+  requireInternalAccountingPeriodAccess,
+  async (req, res, next) => {
+    try {
+      /* ================================================================
+         YEARS
+      ================================================================ */
+
+      const requestedYears = Number(req.query?.years);
+
+      const years =
+        Number.isInteger(requestedYears) && requestedYears > 0
+          ? Math.min(requestedYears, 10)
+          : 2;
+
+      /* ================================================================
+         QUERY
+      ================================================================ */
+
+      const { rows } = await query(
+        `
+        SELECT
+          Audit_ID
+            AS audit_id,
+
+          Accounting_Period_ID
+            AS accounting_period_id,
+
+          Period
+            AS period,
+
+          Action
+            AS action,
+
+          Reason
+            AS reason,
+
+          Changed_By
+            AS changed_by,
+
+          Changed_At_UTC
+            AS changed_at_utc
+
+        FROM dbo.Accounting_Period_Audit
+
+        WHERE Changed_At_UTC >=
+          DATEADD(
+            YEAR,
+            -@p1,
+            GETUTCDATE()
+          )
+
+        ORDER BY
+          Changed_At_UTC DESC,
+          Audit_ID DESC;
+        `,
+        [years],
+      );
+
+      /* ================================================================
+         FORMAT
+      ================================================================ */
+
+      const history = (rows || []).map((row) => ({
+        audit_id: row.audit_id,
+
+        accounting_period_id: row.accounting_period_id || null,
+
+        period: row.period || "",
+
+        action: String(row.action || "")
+          .trim()
+          .toUpperCase(),
+
+        reason: row.reason || "",
+
+        changed_by: row.changed_by || null,
+
+        changed_at_utc: row.changed_at_utc || null,
+      }));
+
+      /* ================================================================
+         RESPONSE
+      ================================================================ */
+
+      return res.status(200).json({
+        success: true,
+
+        years,
+
+        count: history.length,
+
+        history,
+      });
+    } catch (error) {
+      console.error("❌ GET /reports/accounting-periods/history error:", error);
+
+      next(error);
     }
   },
 );
