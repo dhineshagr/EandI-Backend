@@ -178,12 +178,37 @@ function getUserDisplayName(user) {
 /* ============================================================================
    POST /api/uploads/register
 
-   Supports:
-   - Existing payload: period: "2026-07"
-   - New payload: periods: ["2026-04", "2026-05", "2026-06"]
-   - Locked-period validation
-   - Supplier-specific contract validation
-   - Report and Accrual upload types
+   PERIOD MODEL
+   --------------------------------------------------------------------------
+   Report Period(s)
+   - Used for reporting/search/dashboard filtering
+   - May contain one or multiple months
+   - NOT affected by accounting-period locks
+   - Individual values stored in dbo.Report_Period
+   - Report_Number.Period remains populated as a backward-compatible summary
+
+   Posting Period(s)
+   - Accounting / NetSuite period
+   - May contain one or multiple months in the UI
+   - The END/LATEST month is stored in Report_Number.Posting_Period
+   - Accounting-period lock validation applies here
+
+   BACKWARD COMPATIBILITY
+   --------------------------------------------------------------------------
+   Old payload:
+     period: "2026-07"
+     periods: ["2026-07"]
+
+   New payload:
+     report_periods: ["2026-01", "2026-02", "2026-03"]
+     posting_periods: ["2026-01", "2026-02", "2026-03"]
+     posting_period: "2026-03"
+
+   Existing:
+   - Supplier/Contract validation preserved
+   - Related report validation preserved
+   - User authorization preserved
+   - Report_Number + Report_Period transaction preserved
 ============================================================================ */
 
 router.post("/register", requireAuth, async (req, res) => {
@@ -192,14 +217,31 @@ router.post("/register", requireAuth, async (req, res) => {
       filename,
       report_type = "Sales",
       note = "",
+
+      // ---------------------------------------------------------------
+      // NEW PERIOD MODEL
+      // ---------------------------------------------------------------
+      report_periods = [],
+      posting_period = null,
+      posting_periods = [],
+
+      // ---------------------------------------------------------------
+      // LEGACY PERIOD FIELDS
+      // Keep temporarily for backward compatibility
+      // ---------------------------------------------------------------
       period = null,
       periods = [],
+
       bp_code = null,
       contract_id = null,
       related_report_number = null,
     } = req.body || {};
 
     const user = req.user || {};
+
+    /* ----------------------------------------------------------------
+       REQUIRED FIELDS
+    ---------------------------------------------------------------- */
 
     if (!filename) {
       return res.status(400).json({
@@ -208,38 +250,133 @@ router.post("/register", requireAuth, async (req, res) => {
     }
 
     filename = String(filename).trim();
+
     report_type = String(report_type || "Sales").trim();
+
     note = note ? String(note).trim() : "";
+
     bp_code = bp_code ? String(bp_code).trim() : null;
+
     contract_id = contract_id ? String(contract_id).trim() : null;
 
-    const normalizedPeriods = normalizePeriods(period, periods);
+    /* ==================================================================
+       REPORT PERIODS
+       ------------------------------------------------------------------
+       New frontend sends:
+         report_periods
 
-    if (normalizedPeriods.length === 0) {
+       Older frontend sends:
+         period / periods
+
+       Use legacy values only when report_periods was not supplied.
+    ================================================================== */
+
+    let normalizedReportPeriods = normalizePeriods(null, report_periods);
+
+    if (normalizedReportPeriods.length === 0) {
+      normalizedReportPeriods = normalizePeriods(period, periods);
+    }
+
+    if (normalizedReportPeriods.length === 0) {
       return res.status(400).json({
-        error: "At least one period is required",
+        error: "At least one Report Period is required",
       });
     }
 
-    const invalidPeriods = normalizedPeriods.filter(
+    const invalidReportPeriods = normalizedReportPeriods.filter(
       (selectedPeriod) => !isValidPeriod(selectedPeriod),
     );
 
-    if (invalidPeriods.length > 0) {
+    if (invalidReportPeriods.length > 0) {
       return res.status(400).json({
-        error: "Invalid period format",
-        details: `Use YYYY-MM format. Invalid period(s): ${invalidPeriods.join(
-          ", ",
-        )}`,
+        error: "Invalid Report Period format",
+
+        details:
+          "Use YYYY-MM format. Invalid Report Period(s): " +
+          invalidReportPeriods.join(", "),
       });
     }
 
-    if (normalizedPeriods.length > 36) {
+    if (normalizedReportPeriods.length > 36) {
       return res.status(400).json({
-        error: "Too many periods selected",
-        details: "A maximum of 36 periods can be selected for one report.",
+        error: "Too many Report Periods selected",
+
+        details:
+          "A maximum of 36 Report Periods can be selected for one report.",
       });
     }
+
+    /*
+     * Report period summary remains in Report_Number.Period
+     * temporarily so existing dashboards/routes continue working.
+     */
+    const reportPeriodSummary = buildPeriodSummary(normalizedReportPeriods);
+
+    /* ==================================================================
+       POSTING PERIODS
+    ================================================================== */
+
+    let normalizedPostingPeriods = normalizePeriods(
+      posting_period,
+      posting_periods,
+    );
+
+    /*
+     * Backward compatibility:
+     *
+     * If an older frontend does not send posting-period fields,
+     * use the END/LATEST Report Period as Posting Period.
+     */
+    if (normalizedPostingPeriods.length === 0) {
+      normalizedPostingPeriods = [
+        normalizedReportPeriods[normalizedReportPeriods.length - 1],
+      ];
+    }
+
+    const invalidPostingPeriods = normalizedPostingPeriods.filter(
+      (selectedPeriod) => !isValidPeriod(selectedPeriod),
+    );
+
+    if (invalidPostingPeriods.length > 0) {
+      return res.status(400).json({
+        error: "Invalid Posting Period format",
+
+        details:
+          "Use YYYY-MM format. Invalid Posting Period(s): " +
+          invalidPostingPeriods.join(", "),
+      });
+    }
+
+    if (normalizedPostingPeriods.length > 36) {
+      return res.status(400).json({
+        error: "Too many Posting Periods selected",
+
+        details: "A maximum of 36 Posting Periods can be selected.",
+      });
+    }
+
+    /*
+     * Important client requirement:
+     *
+     * For a Posting Period range:
+     *
+     * Start Period: 2026-01
+     * End Period:   2026-03
+     *
+     * Posting_Period saved to Report_Number = 2026-03
+     */
+    const finalPostingPeriod =
+      normalizedPostingPeriods[normalizedPostingPeriods.length - 1];
+
+    if (!finalPostingPeriod) {
+      return res.status(400).json({
+        error: "Posting Period is required",
+      });
+    }
+
+    /* ==================================================================
+       RELATED REPORT NUMBER
+    ================================================================== */
 
     related_report_number =
       related_report_number !== null &&
@@ -258,6 +395,10 @@ router.post("/register", requireAuth, async (req, res) => {
       });
     }
 
+    /* ==================================================================
+       USER / SUPPLIER
+    ================================================================== */
+
     const finalBpCode =
       String(user.user_type || "").toLowerCase() === "bp"
         ? user.bp_code || bp_code || null
@@ -275,14 +416,19 @@ router.post("/register", requireAuth, async (req, res) => {
     }
 
     const uploadedByName = getUserDisplayName(user);
+
     const uploadedByType = user.user_type || "internal";
-    const periodSummary = buildPeriodSummary(normalizedPeriods);
 
-    /* ------------------------------------------------------------------------
-       Check locked periods
-    ------------------------------------------------------------------------ */
+    /* ==================================================================
+       CHECK LOCKED POSTING PERIODS
+       ------------------------------------------------------------------
+       IMPORTANT:
+       Report Periods are NOT checked here.
 
-    const lockedPeriodPlaceholders = normalizedPeriods.map(
+       Only Posting Period(s) are subject to accounting-period locks.
+    ================================================================== */
+
+    const lockedPeriodPlaceholders = normalizedPostingPeriods.map(
       (_, index) => `@p${index + 1}`,
     );
 
@@ -291,32 +437,35 @@ router.post("/register", requireAuth, async (req, res) => {
         Period AS period
       FROM dbo.Accounting_Period
       WHERE Is_Locked = 1
-        AND Period IN (${lockedPeriodPlaceholders.join(", ")});
+        AND Period IN (
+          ${lockedPeriodPlaceholders.join(", ")}
+        );
     `;
 
-    const { rows: lockedPeriods } = await query(
+    const { rows: lockedPostingPeriods } = await query(
       lockedPeriodSql,
-      normalizedPeriods,
+      normalizedPostingPeriods,
     );
 
-    if (lockedPeriods?.length > 0) {
+    if (lockedPostingPeriods && lockedPostingPeriods.length > 0) {
       return res.status(409).json({
-        error: "One or more selected periods are locked",
-        locked_periods: lockedPeriods.map((item) => item.period),
+        error: "One or more selected Posting Periods are locked",
+
+        locked_periods: lockedPostingPeriods.map((item) => item.period),
       });
     }
 
-    /* ------------------------------------------------------------------------
-       Check related report number
-    ------------------------------------------------------------------------ */
+    /* ==================================================================
+       CHECK RELATED REPORT NUMBER
+    ================================================================== */
 
     if (related_report_number !== null) {
       const { rows: relatedReportRows } = await query(
         `
-        SELECT TOP 1
-          Report_Number AS report_number
-        FROM dbo.Report_Number
-        WHERE Report_Number = @p1;
+          SELECT TOP 1
+            Report_Number AS report_number
+          FROM dbo.Report_Number
+          WHERE Report_Number = @p1;
         `,
         [related_report_number],
       );
@@ -328,20 +477,20 @@ router.post("/register", requireAuth, async (req, res) => {
       }
     }
 
-    /* ------------------------------------------------------------------------
-       Validate supplier and contract combination
-    ------------------------------------------------------------------------ */
+    /* ==================================================================
+       VALIDATE SUPPLIER / CONTRACT
+    ================================================================== */
 
     if (contract_id && finalBpCode) {
       const { rows: contractRows } = await query(
         `
-        SELECT TOP 1
-          Contract_ID AS contract_id,
-          BP_Code AS bp_code
-        FROM dbo.Ref_Contract
-        WHERE Contract_ID = @p1
-          AND BP_Code = @p2
-          AND Active_Flag = 1;
+          SELECT TOP 1
+            Contract_ID AS contract_id,
+            BP_Code AS bp_code
+          FROM dbo.Ref_Contract
+          WHERE Contract_ID = @p1
+            AND BP_Code = @p2
+            AND Active_Flag = 1;
         `,
         [contract_id, finalBpCode],
       );
@@ -353,48 +502,98 @@ router.post("/register", requireAuth, async (req, res) => {
       }
     }
 
+    /* ==================================================================
+       DEBUG LOGGING
+    ================================================================== */
+
     console.log("📥 Register Upload Payload:", {
       filename,
       report_type,
-      period: periodSummary,
-      periods: normalizedPeriods,
+
+      report_period_summary: reportPeriodSummary,
+
+      report_periods: normalizedReportPeriods,
+
+      posting_period: finalPostingPeriod,
+
+      posting_periods: normalizedPostingPeriods,
+
       bp_code: finalBpCode,
+
       contract_id,
+
       related_report_number,
+
       user_type: user.user_type,
+
       uploadedBy,
     });
 
-    /*
-      First 10 parameters are used for Report_Number.
-      The remaining parameters are used for Report_Period.
-    */
+    /* ==================================================================
+       DATABASE PARAMETERS
+
+       Parameter map:
+
+       @p1  report_type
+       @p2  filename
+       @p3  uploadedBy
+       @p4  note
+       @p5  uploadedByName
+       @p6  uploadedByType
+
+       @p7  Report_Number.Period
+            backward-compatible Report Period summary
+
+       @p8  Report_Number.Posting_Period
+
+       @p9  BP_Code
+       @p10 Contract_ID
+       @p11 Related_Report_Number
+
+       @p12+ Report_Period rows
+    ================================================================== */
+
     const fixedParams = [
-      report_type,
-      filename,
-      uploadedBy,
-      note,
-      uploadedByName,
-      uploadedByType,
-      periodSummary,
-      finalBpCode,
-      contract_id,
-      related_report_number,
+      report_type, // @p1
+      filename, // @p2
+      uploadedBy, // @p3
+      note, // @p4
+      uploadedByName, // @p5
+      uploadedByType, // @p6
+      reportPeriodSummary, // @p7
+      finalPostingPeriod, // @p8
+      finalBpCode, // @p9
+      contract_id, // @p10
+      related_report_number, // @p11
     ];
 
-    const periodInsertValues = normalizedPeriods
-      .map((_, index) => `(@ReportNumber, @p${fixedParams.length + index + 1})`)
-      .join(",\n        ");
+    /* ==================================================================
+       REPORT PERIOD INSERT VALUES
+    ================================================================== */
 
-    /*
-      Report_Number and Report_Period inserts run in one transaction.
-      This prevents a report header from being created without periods.
-    */
+    const periodInsertValues = normalizedReportPeriods
+      .map(
+        (_, index) =>
+          `(
+              @ReportNumber,
+              @p${fixedParams.length + index + 1}
+            )`,
+      )
+      .join(",\n");
+
+    /* ==================================================================
+       INSERT REPORT
+       ------------------------------------------------------------------
+       Both Report_Number and Report_Period are created in one transaction.
+    ================================================================== */
+
     const sql = `
       SET XACT_ABORT ON;
+
       BEGIN TRANSACTION;
 
       BEGIN TRY
+
         DECLARE @InsertedReport TABLE
         (
           report_number BIGINT,
@@ -405,7 +604,11 @@ router.post("/register", requireAuth, async (req, res) => {
           uploaded_at_utc DATETIME2(7),
           status NVARCHAR(50),
           uploaded_by_type NVARCHAR(MAX),
+
           period NVARCHAR(20),
+
+          posting_period NVARCHAR(20),
+
           bp_code NVARCHAR(50),
           contract_id NVARCHAR(50),
           related_report_number BIGINT
@@ -421,11 +624,16 @@ router.post("/register", requireAuth, async (req, res) => {
           Note,
           Uploaded_By_Name,
           Uploaded_By_Type,
+
           Period,
+
+          Posting_Period,
+
           BP_Code,
           Contract_ID,
           Related_Report_Number
         )
+
         OUTPUT
           INSERTED.Report_Number,
           INSERTED.Report_Type,
@@ -435,11 +643,17 @@ router.post("/register", requireAuth, async (req, res) => {
           INSERTED.Uploaded_At_UTC,
           INSERTED.Status,
           INSERTED.Uploaded_By_Type,
+
           INSERTED.Period,
+
+          INSERTED.Posting_Period,
+
           INSERTED.BP_Code,
           INSERTED.Contract_ID,
           INSERTED.Related_Report_Number
+
         INTO @InsertedReport
+
         VALUES
         (
           @p1,
@@ -450,18 +664,33 @@ router.post("/register", requireAuth, async (req, res) => {
           @p4,
           @p5,
           @p6,
+
           @p7,
+
           @p8,
+
           @p9,
-          @p10
+          @p10,
+          @p11
         );
 
         DECLARE @ReportNumber BIGINT;
 
         SELECT TOP 1
-          @ReportNumber = report_number
+          @ReportNumber =
+            report_number
         FROM @InsertedReport;
 
+        /*
+         * Report Period(s)
+         *
+         * These are used for:
+         * - Reporting
+         * - Dashboard filtering
+         * - Search
+         *
+         * They are intentionally separate from Posting_Period.
+         */
         INSERT INTO dbo.Report_Period
         (
           Report_Number,
@@ -481,41 +710,74 @@ router.post("/register", requireAuth, async (req, res) => {
           uploaded_at_utc,
           status,
           uploaded_by_type,
+
           period,
+
+          posting_period,
+
           bp_code,
           contract_id,
           related_report_number
+
         FROM @InsertedReport;
+
       END TRY
+
       BEGIN CATCH
+
         IF @@TRANCOUNT > 0
         BEGIN
           ROLLBACK TRANSACTION;
         END;
 
         THROW;
+
       END CATCH;
     `;
 
-    const params = [...fixedParams, ...normalizedPeriods];
+    const params = [...fixedParams, ...normalizedReportPeriods];
 
     const { rows } = await query(sql, params);
+
     const inserted = rows?.[0];
 
     console.log("✅ Upload registered:", {
       ...inserted,
-      periods: normalizedPeriods,
+
+      report_periods: normalizedReportPeriods,
+
+      posting_period: finalPostingPeriod,
+
+      posting_periods: normalizedPostingPeriods,
     });
+
+    /* ==================================================================
+       RESPONSE
+    ================================================================== */
 
     return res.json({
       success: true,
+
       data: {
         ...inserted,
-        periods: normalizedPeriods,
+
+        report_periods: normalizedReportPeriods,
+
+        posting_period: finalPostingPeriod,
+
+        posting_periods: normalizedPostingPeriods,
       },
+
       report_number: inserted?.report_number,
+
       status: inserted?.status || "new",
-      periods: normalizedPeriods,
+
+      report_periods: normalizedReportPeriods,
+
+      posting_period: finalPostingPeriod,
+
+      posting_periods: normalizedPostingPeriods,
+
       message:
         "Upload registered successfully. Processing will continue through the backend workflow.",
     });
@@ -524,6 +786,7 @@ router.post("/register", requireAuth, async (req, res) => {
 
     return res.status(500).json({
       error: "Failed to register upload",
+
       details: err.message,
     });
   }
