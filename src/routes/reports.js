@@ -498,33 +498,79 @@ router.post("/reports/register", requireAuth, async (req, res, next) => {
 
 /* ======================================================================
    LIST REPORTS (Dashboard)
+
+   PERIOD MODEL
+   ----------------------------------------------------------------------
+   Report Period:
+   - Report_Number.Period = display summary
+   - Report_Period = selected Report Period values
+
+   Posting Period:
+   - Posting_Period_Start = range start
+   - Posting_Period = range end / NetSuite posting period
+
+   Other existing behavior preserved:
+   - Supplier filtering
+   - Multiple Report Periods
+   - Status calculations
+   - Zero Sales behavior
+   - Purchase / CAF totals
+   - Detail counts
+   - BP access
 ====================================================================== */
-/* ======================================================================
-   LIST REPORTS (Dashboard)
-   - Supports legacy single period
-   - Supports multiple periods from Report_Period
-   - Returns both period and periods[]
-   - Prevents Report_Period from multiplying detail-row totals
-====================================================================== */
+
 router.get("/reports/list", requireAuth, async (req, res, next) => {
   try {
     const sql = `
       SELECT
         r.Report_Number AS report_number,
+
         r.FileName AS filename,
+
         r.Report_Type AS report_type,
 
+
+        /* ================================================================
+           REPORT PERIOD
+        ================================================================ */
+
         COALESCE(
-          NULLIF(period_data.selected_periods, ''),
-          NULLIF(r.Period, '')
+          NULLIF(r.Period, ''),
+          NULLIF(period_data.selected_periods, '')
         ) AS period,
 
+
+        /* ================================================================
+           POSTING PERIOD
+        ================================================================ */
+
+        r.Posting_Period_Start
+          AS posting_period_start,
+
+        r.Posting_Period
+          AS posting_period,
+
+
+        /* ================================================================
+           SUPPLIER / CONTRACT
+        ================================================================ */
+
         r.BP_Code AS bp_code,
+
         s.Supplier_Name AS supplier_name,
+
         r.Contract_ID AS contract_id,
-        r.Related_Report_Number AS related_report_number,
+
+        r.Related_Report_Number
+          AS related_report_number,
+
+
+        /* ================================================================
+           UPLOAD INFORMATION
+        ================================================================ */
 
         r.Uploaded_By AS uploaded_by,
+
         r.Uploaded_At_UTC AS uploaded_at_utc,
 
         COALESCE(
@@ -533,232 +579,513 @@ router.get("/reports/list", requireAuth, async (req, res, next) => {
           'System'
         ) AS uploaded_by_display,
 
-        r.Uploaded_By_Name AS uploaded_by_name,
-        r.Uploaded_By_Type AS uploaded_by_type,
+        r.Uploaded_By_Name
+          AS uploaded_by_name,
 
-        COUNT(d.Cur_Detail_ID) AS total_rows,
+        r.Uploaded_By_Type
+          AS uploaded_by_type,
+
+
+        /* ================================================================
+           COUNTS
+        ================================================================ */
+
+        COUNT(
+          d.Cur_Detail_ID
+        ) AS total_rows,
+
 
         SUM(
           CASE
-            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
-              THEN 1
+            WHEN LOWER(
+              COALESCE(
+                d.DQ_Status,
+                ''
+              )
+            ) = 'passed'
+            THEN 1
             ELSE 0
           END
         ) AS passed_count,
 
+
         SUM(
           CASE
-            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
-              THEN 1
+            WHEN LOWER(
+              COALESCE(
+                d.DQ_Status,
+                ''
+              )
+            ) = 'failed'
+            THEN 1
             ELSE 0
           END
         ) AS failed_count,
 
+
         SUM(
           CASE
-            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
-              THEN 1
+            WHEN LOWER(
+              COALESCE(
+                d.DQ_Status,
+                ''
+              )
+            ) = 'approved'
+            THEN 1
             ELSE 0
           END
         ) AS approved_count,
 
+
         SUM(
           CASE
-            WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
-              THEN 1
+            WHEN LOWER(
+              COALESCE(
+                d.DQ_Status,
+                ''
+              )
+            ) = 'validated'
+            THEN 1
             ELSE 0
           END
         ) AS validated_count,
 
-        /* Purchase total for this report */
+
+        /* ================================================================
+           TOTAL PURCHASE
+        ================================================================ */
+
         COALESCE(
           SUM(
             TRY_CAST(
-              d.Purchase_Dollars_Calc AS DECIMAL(19, 2)
+              d.Purchase_Dollars_Calc
+                AS DECIMAL(19, 2)
             )
           ),
           0
         ) AS total_purchase,
 
-        /* CAF total for this report */
+
+        /* ================================================================
+           TOTAL CAF
+        ================================================================ */
+
         COALESCE(
           SUM(
             TRY_CAST(
-              d.CAF_Dollars AS DECIMAL(19, 2)
+              d.CAF_Dollars
+                AS DECIMAL(19, 2)
             )
           ),
           0
         ) AS total_caf,
 
+
+        /* ================================================================
+           STATUS
+        ================================================================ */
+
         CASE
-          /*
-           * Zero Sales reports do not have detail rows.
-           */
-          WHEN UPPER(LTRIM(RTRIM(r.FileName))) = 'ZERO_SALES'
-            OR UPPER(LTRIM(RTRIM(r.FileName))) LIKE 'ZERO_SALES%'
-            THEN 'submitted'
 
-          /*
-           * Prefer explicit approved status from Report_Number.
-           */
-          WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) = 'approved'
-            THEN 'approved'
+          /* --------------------------------------------------------------
+             ZERO SALES
+          -------------------------------------------------------------- */
 
-          /*
-           * Any failed row means the report failed.
-           */
-          WHEN SUM(
-            CASE
-              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'failed'
-                THEN 1
-              ELSE 0
-            END
-          ) > 0
-            THEN 'failed'
-
-          /*
-           * All detail rows approved.
-           */
-          WHEN COUNT(d.Cur_Detail_ID) > 0
-            AND SUM(
-              CASE
-                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'approved'
-                  THEN 1
-                ELSE 0
-              END
-            ) = COUNT(d.Cur_Detail_ID)
-            THEN 'approved'
-
-          /*
-           * All detail rows passed.
-           */
-          WHEN COUNT(d.Cur_Detail_ID) > 0
-            AND SUM(
-              CASE
-                WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'passed'
-                  THEN 1
-                ELSE 0
-              END
-            ) = COUNT(d.Cur_Detail_ID)
-            THEN 'passed'
-
-          /*
-           * At least one validated row.
-           */
-          WHEN SUM(
-            CASE
-              WHEN LOWER(COALESCE(d.DQ_Status, '')) = 'validated'
-                THEN 1
-              ELSE 0
-            END
-          ) > 0
-            THEN 'validated'
-
-          /*
-           * Preserve current Report_Number status when available.
-           */
-          WHEN LOWER(COALESCE(NULLIF(r.Status, ''), '')) IN
-            (
-              'new',
-              'staged',
-              'submitted',
-              'pending',
-              'processing'
+          WHEN UPPER(
+            LTRIM(
+              RTRIM(
+                r.FileName
+              )
             )
-            THEN LOWER(r.Status)
+          ) = 'ZERO_SALES'
 
-          /*
-           * No detail rows yet.
-           */
+            OR UPPER(
+              LTRIM(
+                RTRIM(
+                  r.FileName
+                )
+              )
+            ) LIKE 'ZERO_SALES%'
+
+          THEN 'submitted'
+
+
+          /* --------------------------------------------------------------
+             EXPLICIT APPROVED STATUS
+          -------------------------------------------------------------- */
+
+          WHEN LOWER(
+            COALESCE(
+              NULLIF(
+                r.Status,
+                ''
+              ),
+              ''
+            )
+          ) = 'approved'
+
+          THEN 'approved'
+
+
+          /* --------------------------------------------------------------
+             FAILED ROW EXISTS
+          -------------------------------------------------------------- */
+
+          WHEN SUM(
+            CASE
+              WHEN LOWER(
+                COALESCE(
+                  d.DQ_Status,
+                  ''
+                )
+              ) = 'failed'
+              THEN 1
+              ELSE 0
+            END
+          ) > 0
+
+          THEN 'failed'
+
+
+          /* --------------------------------------------------------------
+             ALL ROWS APPROVED
+          -------------------------------------------------------------- */
+
+          WHEN COUNT(
+            d.Cur_Detail_ID
+          ) > 0
+
+          AND SUM(
+            CASE
+              WHEN LOWER(
+                COALESCE(
+                  d.DQ_Status,
+                  ''
+                )
+              ) = 'approved'
+              THEN 1
+              ELSE 0
+            END
+          ) = COUNT(
+            d.Cur_Detail_ID
+          )
+
+          THEN 'approved'
+
+
+          /* --------------------------------------------------------------
+             ALL ROWS PASSED
+          -------------------------------------------------------------- */
+
+          WHEN COUNT(
+            d.Cur_Detail_ID
+          ) > 0
+
+          AND SUM(
+            CASE
+              WHEN LOWER(
+                COALESCE(
+                  d.DQ_Status,
+                  ''
+                )
+              ) = 'passed'
+              THEN 1
+              ELSE 0
+            END
+          ) = COUNT(
+            d.Cur_Detail_ID
+          )
+
+          THEN 'passed'
+
+
+          /* --------------------------------------------------------------
+             VALIDATED ROWS
+          -------------------------------------------------------------- */
+
+          WHEN SUM(
+            CASE
+              WHEN LOWER(
+                COALESCE(
+                  d.DQ_Status,
+                  ''
+                )
+              ) = 'validated'
+              THEN 1
+              ELSE 0
+            END
+          ) > 0
+
+          THEN 'validated'
+
+
+          /* --------------------------------------------------------------
+             PRESERVE CURRENT PROCESSING STATUS
+          -------------------------------------------------------------- */
+
+          WHEN LOWER(
+            COALESCE(
+              NULLIF(
+                r.Status,
+                ''
+              ),
+              ''
+            )
+          ) IN
+          (
+            'new',
+            'staged',
+            'submitted',
+            'pending',
+            'processing'
+          )
+
+          THEN LOWER(
+            r.Status
+          )
+
+
+          /* --------------------------------------------------------------
+             DEFAULT
+          -------------------------------------------------------------- */
+
           ELSE 'pending'
+
         END AS status
+
 
       FROM dbo.Report_Number r
 
+
+      /* ==================================================================
+         SUPPLIER
+      ================================================================== */
+
       LEFT JOIN dbo.Ref_Supplier s
-        ON s.BP_Code = r.BP_Code
+
+        ON s.BP_Code =
+           r.BP_Code
+
+
+      /* ==================================================================
+         DETAIL ROWS
+      ================================================================== */
 
       LEFT JOIN dbo.Cur_Invoice_Detail d
-        ON d.Report_Number = r.Report_Number
 
-      /*
-       * Aggregate periods before joining to detail records.
-       * This prevents duplicate detail counts and dollar totals.
-       */
-      OUTER APPLY (
+        ON d.Report_Number =
+           r.Report_Number
+
+
+      /* ==================================================================
+         REPORT PERIODS
+
+         Aggregate first so detail rows are not duplicated.
+      ================================================================== */
+
+      OUTER APPLY
+      (
         SELECT
+
           STRING_AGG(
-            CAST(period_rows.Period AS NVARCHAR(50)),
+            CAST(
+              period_rows.Period
+                AS NVARCHAR(50)
+            ),
             ', '
           ) AS selected_periods
-        FROM (
+
+        FROM
+        (
           SELECT DISTINCT
+
             rp.Period
+
           FROM dbo.Report_Period rp
-          WHERE rp.Report_Number = r.Report_Number
-            AND rp.Period IS NOT NULL
+
+          WHERE
+            rp.Report_Number =
+              r.Report_Number
+
+            AND rp.Period
+              IS NOT NULL
+
             AND LTRIM(
-              RTRIM(
-                CAST(rp.Period AS NVARCHAR(50))
-              )
-            ) <> ''
+                  RTRIM(
+                    CAST(
+                      rp.Period
+                        AS NVARCHAR(50)
+                    )
+                  )
+                ) <> ''
+
         ) period_rows
+
       ) period_data
 
-      WHERE (@p1 = 0 OR LOWER(LTRIM(RTRIM(r.BP_Code))) = LOWER(@p2))
+
+      /* ==================================================================
+         BP SECURITY
+      ================================================================== */
+
+      WHERE
+        (
+          @p1 = 0
+
+          OR LOWER(
+               LTRIM(
+                 RTRIM(
+                   r.BP_Code
+                 )
+               )
+             )
+             =
+             LOWER(
+               @p2
+             )
+        )
+
+
+      /* ==================================================================
+         GROUP BY
+      ================================================================== */
 
       GROUP BY
+
         r.Report_Number,
+
         r.FileName,
+
         r.Report_Type,
+
         r.Period,
+
+        r.Posting_Period_Start,
+
+        r.Posting_Period,
+
         period_data.selected_periods,
+
         r.BP_Code,
+
         s.Supplier_Name,
+
         r.Contract_ID,
+
         r.Related_Report_Number,
+
         r.Uploaded_By,
+
         r.Uploaded_By_Name,
+
         r.Uploaded_By_Type,
+
         r.Uploaded_At_UTC,
+
         r.Status
+
 
       ORDER BY
         r.Uploaded_At_UTC DESC;
     `;
 
+    /* ====================================================================
+       BP ACCESS
+    ==================================================================== */
+
     const bpOnly = isBpUser(req) ? 1 : 0;
+
     const bpCode = isBpUser(req) ? getBpCode(req) : "";
 
     if (isBpUser(req) && !bpCode) {
       return res.status(403).json({
         error: "A supplier code is not assigned to this Business Partner user",
+
         code: "BP_CODE_REQUIRED",
       });
     }
 
+    /* ====================================================================
+       EXECUTE
+    ==================================================================== */
+
     const { rows } = await query(sql, [bpOnly, bpCode]);
 
+    /* ====================================================================
+       FORMAT RESPONSE
+    ==================================================================== */
+
     const reports = rows.map((report) => {
-      const periods = String(report.period || "")
-        .split(",")
-        .map((value) => value.trim())
-        .filter(Boolean);
+      /* --------------------------------------------------------------
+             REPORT PERIODS
+
+             Prefer the Report_Period rows.
+
+             Example:
+               "2026-01, 2026-03"
+
+             becomes:
+               ["2026-01", "2026-03"]
+          -------------------------------------------------------------- */
+
+      let periods = [];
+
+      if (report.period) {
+        const periodValue = String(report.period).trim();
+
+        /*
+         * New range summary:
+         *
+         * 2026-01 to 2026-03
+         */
+        if (periodValue.includes(" to ")) {
+          periods = periodValue
+            .split(" to ")
+            .map((value) => value.trim())
+            .filter(Boolean);
+        } else {
+          /*
+           * Existing comma-separated format.
+           */
+          periods = periodValue
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean);
+        }
+      }
+
+      periods = Array.from(new Set(periods)).sort((left, right) =>
+        left.localeCompare(right),
+      );
 
       return {
         ...report,
+
         periods,
 
+        /*
+         * Explicit new period fields.
+         */
+        posting_period_start: report.posting_period_start || null,
+
+        posting_period: report.posting_period || null,
+
         total_purchase: Number(report.total_purchase || 0),
+
         total_caf: Number(report.total_caf || 0),
       };
     });
+
+    /* ====================================================================
+       RESPONSE
+    ==================================================================== */
 
     return res.json({
       reports,
     });
   } catch (err) {
     console.error("❌ GET /reports/list error:", err);
+
     next(err);
   }
 });
