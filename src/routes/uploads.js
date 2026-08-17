@@ -935,21 +935,31 @@ router.post("/register", requireAuth, async (req, res) => {
    - Supplier user: only their uploads
    - Admin, Accounting, SSP Admin: all uploads
    - Other internal users: only their uploads
-============================================================================ */
 
-/* ============================================================================
-   GET /api/uploads/recent
+   Period Model:
+   - rn.Period = Report Period summary
+       Example: 2026-01 to 2026-03
 
-   Rules:
-   - Supplier user: only their uploads
-   - Admin, Accounting, SSP Admin: all uploads
-   - Other internal users: only their uploads
+   - dbo.Report_Period = individual Report Period selections
+       Example:
+         2026-01
+         2026-03
+
+   - rn.Posting_Period_Start = Posting Period start
+       Example: 2026-05
+
+   - rn.Posting_Period = Posting Period end/latest month
+       Example: 2026-08
+
+   - Posting_Period is the final posting month used for NetSuite.
 
    Supports:
    - Existing single-period records
-   - New multi-period records from Report_Period
+   - New multi-period Report Period records
+   - Posting Period start/end
    - Friendly display information
    - No duplicate report rows
+   - Existing user authorization
 ============================================================================ */
 
 router.get("/recent", requireAuth, async (req, res) => {
@@ -962,6 +972,10 @@ router.get("/recent", requireAuth, async (req, res) => {
 
     const params = [];
     const filters = [];
+
+    /* ======================================================================
+       USER FILTERING
+    ====================================================================== */
 
     /*
       Supplier and non-privileged internal users should see only
@@ -984,6 +998,10 @@ router.get("/recent", requireAuth, async (req, res) => {
       filters.push(`LOWER(rn.Uploaded_By) = LOWER(@p${params.length})`);
     }
 
+    /* ======================================================================
+       REPORT TYPE FILTER
+    ====================================================================== */
+
     if (requestedReportType) {
       params.push(requestedReportType);
 
@@ -993,18 +1011,30 @@ router.get("/recent", requireAuth, async (req, res) => {
     const whereClause =
       filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
 
-    /*
-      OUTER APPLY aggregates all Report_Period rows into one value.
-      This prevents one recent-upload row from becoming multiple rows.
+    /* ======================================================================
+       QUERY
 
-      COALESCE falls back to Report_Number.Period for old records that
-      were created before Report_Period was introduced.
-    */
+       Report Period:
+         rn.Period
+         dbo.Report_Period
+
+       Posting Period:
+         rn.Posting_Period_Start
+         rn.Posting_Period
+
+       OUTER APPLY aggregates dbo.Report_Period so one report still
+       returns only one Recent Upload row.
+    ====================================================================== */
+
     const sql = `
       SELECT TOP 20
+
         rn.Report_Number AS report_number,
+
         rn.Report_Type AS report_type,
+
         rn.Filename AS filename,
+
         rn.Uploaded_By AS uploaded_by,
 
         ISNULL(
@@ -1013,69 +1043,176 @@ router.get("/recent", requireAuth, async (req, res) => {
         ) AS uploaded_by_name,
 
         rn.Uploaded_At_UTC AS uploaded_at_utc,
+
         rn.Status AS status,
+
         rn.Uploaded_By_Type AS uploaded_by_type,
+
+
+        /* ================================================================
+           REPORT PERIOD
+
+           Example:
+             2026-01 to 2026-03
+        ================================================================ */
 
         rn.Period AS period,
 
+
+        /* ================================================================
+           POSTING PERIOD
+
+           Example:
+             Start = 2026-05
+             End   = 2026-08
+        ================================================================ */
+
+        rn.Posting_Period_Start AS posting_period_start,
+
+        rn.Posting_Period AS posting_period,
+
+
+        /* ================================================================
+           INDIVIDUAL REPORT PERIOD VALUES
+
+           Example:
+             2026-01,2026-03
+        ================================================================ */
+
         COALESCE(
-          NULLIF(period_data.selected_periods, ''),
-          rn.Period
+          NULLIF(
+            period_data.selected_periods,
+            ''
+          ),
+
+          CASE
+            WHEN rn.Period LIKE
+                 '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+            THEN rn.Period
+            ELSE NULL
+          END
+
         ) AS selected_periods,
+
 
         ISNULL(
           period_data.period_count,
+
           CASE
-            WHEN rn.Period IS NULL OR LTRIM(RTRIM(rn.Period)) = ''
-              THEN 0
+            WHEN rn.Period IS NULL
+              OR LTRIM(RTRIM(rn.Period)) = ''
+            THEN 0
             ELSE 1
           END
+
         ) AS period_count,
 
+
+        /* ================================================================
+           SUPPLIER / CONTRACT / RELATED REPORT
+        ================================================================ */
+
         rn.BP_Code AS bp_code,
+
         s.Supplier_Name AS supplier_name,
+
         rn.Contract_ID AS contract_id,
+
         rn.Related_Report_Number AS related_report_number
+
 
       FROM dbo.Report_Number rn
 
+
+      /* ==================================================================
+         SUPPLIER
+      ================================================================== */
+
       LEFT JOIN dbo.Ref_Supplier s
+
         ON s.BP_Code = rn.BP_Code
+
+
+      /* ==================================================================
+         REPORT PERIODS
+
+         Aggregate all Report_Period rows into one Recent Upload record.
+      ================================================================== */
 
       OUTER APPLY
       (
         SELECT
+
           STRING_AGG(
-            CAST(rp.Period AS NVARCHAR(MAX)),
+            CAST(
+              rp.Period AS NVARCHAR(MAX)
+            ),
             ','
-          ) WITHIN GROUP
+          )
+          WITHIN GROUP
           (
             ORDER BY rp.Period
           ) AS selected_periods,
 
+
           COUNT(*) AS period_count
 
+
         FROM dbo.Report_Period rp
-        WHERE rp.Report_Number = rn.Report_Number
+
+        WHERE
+          rp.Report_Number = rn.Report_Number
+
       ) period_data
+
 
       ${whereClause}
 
-      ORDER BY rn.Uploaded_At_UTC DESC;
+
+      ORDER BY
+        rn.Uploaded_At_UTC DESC;
     `;
+
+    /* ======================================================================
+       EXECUTE QUERY
+    ====================================================================== */
 
     const { rows } = await query(sql, params);
 
+    /* ======================================================================
+       FORMAT RESPONSE
+    ====================================================================== */
+
     const items = (rows || []).map((item) => {
+      /* ------------------------------------------------------------------
+         REPORT PERIOD ARRAY
+
+         Example:
+           selected_periods = "2026-01,2026-03"
+
+         becomes:
+
+           periods = [
+             "2026-01",
+             "2026-03"
+           ]
+      ------------------------------------------------------------------ */
+
       const periods = String(item.selected_periods || "")
         .split(",")
         .map((periodValue) => periodValue.trim())
         .filter(Boolean);
 
       /*
-        Backward-compatible fallback for records that have only
-        Report_Number.Period.
+        Backward compatibility.
+
+        Older reports may only have:
+
+          Report_Number.Period = 2026-03
+
+        and may not have rows in Report_Period.
       */
+
       if (
         periods.length === 0 &&
         item.period &&
@@ -1084,12 +1221,72 @@ router.get("/recent", requireAuth, async (req, res) => {
         periods.push(String(item.period));
       }
 
+      /* ------------------------------------------------------------------
+         POSTING PERIOD DISPLAY
+
+         Example 1:
+
+           Posting_Period_Start = 2026-05
+           Posting_Period       = 2026-08
+
+         Display:
+
+           Start Period: 2026-05 End Period: 2026-08
+
+
+         Example 2:
+
+           Posting_Period_Start = 2026-08
+           Posting_Period       = 2026-08
+
+         Display:
+
+           2026-08
+      ------------------------------------------------------------------ */
+
+      let postingPeriodDisplay = null;
+
+      if (
+        item.posting_period_start &&
+        item.posting_period &&
+        item.posting_period_start !== item.posting_period
+      ) {
+        postingPeriodDisplay =
+          `Start Period: ${item.posting_period_start} ` +
+          `End Period: ${item.posting_period}`;
+      } else {
+        postingPeriodDisplay =
+          item.posting_period || item.posting_period_start || null;
+      }
+
+      /* ------------------------------------------------------------------
+         FINAL ITEM
+      ------------------------------------------------------------------ */
+
       return {
         ...item,
+
+        /*
+          Individual Report Period values.
+        */
         periods,
+
+        /*
+          Friendly Posting Period range.
+        */
+        posting_period_display: postingPeriodDisplay,
+
+        /*
+          Existing download behavior.
+          Do not change.
+        */
         download_key: item.report_number,
       };
     });
+
+    /* ======================================================================
+       RESPONSE
+    ====================================================================== */
 
     return res.json({
       items,
@@ -1099,6 +1296,7 @@ router.get("/recent", requireAuth, async (req, res) => {
 
     return res.status(500).json({
       error: "Failed to fetch uploads",
+
       details: err.message,
     });
   }
