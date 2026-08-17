@@ -184,14 +184,31 @@ function getUserDisplayName(user) {
    - Used for reporting/search/dashboard filtering
    - May contain one or multiple months
    - NOT affected by accounting-period locks
-   - Individual values stored in dbo.Report_Period
+   - Individual selected values stored in dbo.Report_Period
    - Report_Number.Period remains populated as a backward-compatible summary
 
    Posting Period(s)
    - Accounting / NetSuite period
    - May contain one or multiple months in the UI
-   - The END/LATEST month is stored in Report_Number.Posting_Period
-   - Accounting-period lock validation applies here
+   - START month is stored in Report_Number.Posting_Period_Start
+   - END/LATEST month is stored in Report_Number.Posting_Period
+   - END/LATEST month is the NetSuite posting period
+   - Accounting-period lock validation applies to Posting Period(s)
+
+   EXAMPLE
+   --------------------------------------------------------------------------
+   Report Period:
+     Start Period: 2026-01
+     End Period:   2026-03
+
+   Posting Period:
+     Start Period: 2026-05
+     End Period:   2026-08
+
+   DATABASE:
+     Report_Number.Period               = 2026-01 to 2026-03
+     Report_Number.Posting_Period_Start = 2026-05
+     Report_Number.Posting_Period       = 2026-08
 
    BACKWARD COMPATIBILITY
    --------------------------------------------------------------------------
@@ -200,15 +217,16 @@ function getUserDisplayName(user) {
      periods: ["2026-07"]
 
    New payload:
-     report_periods: ["2026-01", "2026-02", "2026-03"]
-     posting_periods: ["2026-01", "2026-02", "2026-03"]
-     posting_period: "2026-03"
+     report_periods: ["2026-01", "2026-03"]
+     posting_periods: ["2026-05", "2026-08"]
+     posting_period: "2026-08"
 
-   Existing:
-   - Supplier/Contract validation preserved
-   - Related report validation preserved
-   - User authorization preserved
-   - Report_Number + Report_Period transaction preserved
+   Existing functionality preserved:
+   - Supplier/Contract validation
+   - Related report validation
+   - User authorization
+   - Legacy period payload
+   - Report_Number + Report_Period transaction
 ============================================================================ */
 
 router.post("/register", requireAuth, async (req, res) => {
@@ -239,9 +257,9 @@ router.post("/register", requireAuth, async (req, res) => {
 
     const user = req.user || {};
 
-    /* ----------------------------------------------------------------
+    /* ==================================================================
        REQUIRED FIELDS
-    ---------------------------------------------------------------- */
+    ================================================================== */
 
     if (!filename) {
       return res.status(400).json({
@@ -262,13 +280,13 @@ router.post("/register", requireAuth, async (req, res) => {
     /* ==================================================================
        REPORT PERIODS
        ------------------------------------------------------------------
-       New frontend sends:
+       New frontend:
          report_periods
 
-       Older frontend sends:
+       Legacy frontend:
          period / periods
 
-       Use legacy values only when report_periods was not supplied.
+       Legacy values are used only when report_periods is not supplied.
     ================================================================== */
 
     let normalizedReportPeriods = normalizePeriods(null, report_periods);
@@ -307,8 +325,15 @@ router.post("/register", requireAuth, async (req, res) => {
     }
 
     /*
-     * Report period summary remains in Report_Number.Period
-     * temporarily so existing dashboards/routes continue working.
+     * Keep Report_Number.Period populated for backward compatibility.
+     *
+     * Examples:
+     *
+     * Single:
+     *   2026-03
+     *
+     * Range:
+     *   2026-01 to 2026-03
      */
     const reportPeriodSummary = buildPeriodSummary(normalizedReportPeriods);
 
@@ -324,8 +349,9 @@ router.post("/register", requireAuth, async (req, res) => {
     /*
      * Backward compatibility:
      *
-     * If an older frontend does not send posting-period fields,
-     * use the END/LATEST Report Period as Posting Period.
+     * Older frontend versions did not send posting-period fields.
+     *
+     * In that case, use the ending Report Period as the Posting Period.
      */
     if (normalizedPostingPeriods.length === 0) {
       normalizedPostingPeriods = [
@@ -356,19 +382,28 @@ router.post("/register", requireAuth, async (req, res) => {
     }
 
     /*
-     * Important client requirement:
+     * Client requirement:
      *
-     * For a Posting Period range:
+     * Posting Period range:
      *
-     * Start Period: 2026-01
-     * End Period:   2026-03
+     * Start Period: 2026-05
+     * End Period:   2026-08
      *
-     * Posting_Period saved to Report_Number = 2026-03
+     * Stored as:
+     *
+     * Posting_Period_Start = 2026-05
+     * Posting_Period       = 2026-08
+     *
+     * Posting_Period is also the period that will eventually drive
+     * the NetSuite posting date.
      */
+
+    const finalPostingPeriodStart = normalizedPostingPeriods[0];
+
     const finalPostingPeriod =
       normalizedPostingPeriods[normalizedPostingPeriods.length - 1];
 
-    if (!finalPostingPeriod) {
+    if (!finalPostingPeriodStart || !finalPostingPeriod) {
       return res.status(400).json({
         error: "Posting Period is required",
       });
@@ -423,9 +458,15 @@ router.post("/register", requireAuth, async (req, res) => {
        CHECK LOCKED POSTING PERIODS
        ------------------------------------------------------------------
        IMPORTANT:
-       Report Periods are NOT checked here.
 
-       Only Posting Period(s) are subject to accounting-period locks.
+       Report Period(s):
+         NO lock validation
+
+       Posting Period(s):
+         Accounting period lock validation
+
+       Existing behavior is preserved by validating all selected Posting
+       Period values.
     ================================================================== */
 
     const lockedPeriodPlaceholders = normalizedPostingPeriods.map(
@@ -508,11 +549,14 @@ router.post("/register", requireAuth, async (req, res) => {
 
     console.log("📥 Register Upload Payload:", {
       filename,
+
       report_type,
 
       report_period_summary: reportPeriodSummary,
 
       report_periods: normalizedReportPeriods,
+
+      posting_period_start: finalPostingPeriodStart,
 
       posting_period: finalPostingPeriod,
 
@@ -532,25 +576,26 @@ router.post("/register", requireAuth, async (req, res) => {
     /* ==================================================================
        DATABASE PARAMETERS
 
-       Parameter map:
-
-       @p1  report_type
-       @p2  filename
-       @p3  uploadedBy
-       @p4  note
-       @p5  uploadedByName
-       @p6  uploadedByType
+       @p1  Report_Type
+       @p2  Filename
+       @p3  Uploaded_By
+       @p4  Note
+       @p5  Uploaded_By_Name
+       @p6  Uploaded_By_Type
 
        @p7  Report_Number.Period
-            backward-compatible Report Period summary
+            Report Period summary
 
-       @p8  Report_Number.Posting_Period
+       @p8  Report_Number.Posting_Period_Start
 
-       @p9  BP_Code
-       @p10 Contract_ID
-       @p11 Related_Report_Number
+       @p9  Report_Number.Posting_Period
+            End / NetSuite posting month
 
-       @p12+ Report_Period rows
+       @p10 BP_Code
+       @p11 Contract_ID
+       @p12 Related_Report_Number
+
+       @p13+ Report_Period rows
     ================================================================== */
 
     const fixedParams = [
@@ -561,14 +606,19 @@ router.post("/register", requireAuth, async (req, res) => {
       uploadedByName, // @p5
       uploadedByType, // @p6
       reportPeriodSummary, // @p7
-      finalPostingPeriod, // @p8
-      finalBpCode, // @p9
-      contract_id, // @p10
-      related_report_number, // @p11
+      finalPostingPeriodStart, // @p8
+      finalPostingPeriod, // @p9
+      finalBpCode, // @p10
+      contract_id, // @p11
+      related_report_number, // @p12
     ];
 
     /* ==================================================================
        REPORT PERIOD INSERT VALUES
+
+       These values go ONLY into dbo.Report_Period.
+
+       Posting Periods do NOT go into dbo.Report_Period.
     ================================================================== */
 
     const periodInsertValues = normalizedReportPeriods
@@ -582,9 +632,9 @@ router.post("/register", requireAuth, async (req, res) => {
       .join(",\n");
 
     /* ==================================================================
-       INSERT REPORT
-       ------------------------------------------------------------------
-       Both Report_Number and Report_Period are created in one transaction.
+       DATABASE TRANSACTION
+
+       Report_Number + Report_Period are inserted together.
     ================================================================== */
 
     const sql = `
@@ -597,59 +647,96 @@ router.post("/register", requireAuth, async (req, res) => {
         DECLARE @InsertedReport TABLE
         (
           report_number BIGINT,
+
           report_type NVARCHAR(50),
+
           filename NVARCHAR(255),
+
           uploaded_by NVARCHAR(MAX),
+
           uploaded_by_name NVARCHAR(200),
+
           uploaded_at_utc DATETIME2(7),
+
           status NVARCHAR(50),
+
           uploaded_by_type NVARCHAR(MAX),
 
           period NVARCHAR(20),
 
+          posting_period_start NVARCHAR(20),
+
           posting_period NVARCHAR(20),
 
           bp_code NVARCHAR(50),
+
           contract_id NVARCHAR(50),
+
           related_report_number BIGINT
         );
+
+        /* ==============================================================
+           REPORT HEADER
+        ============================================================== */
 
         INSERT INTO dbo.Report_Number
         (
           Report_Type,
+
           Filename,
+
           Uploaded_By,
+
           Uploaded_At_UTC,
+
           Status,
+
           Note,
+
           Uploaded_By_Name,
+
           Uploaded_By_Type,
 
           Period,
 
+          Posting_Period_Start,
+
           Posting_Period,
 
           BP_Code,
+
           Contract_ID,
+
           Related_Report_Number
         )
 
         OUTPUT
           INSERTED.Report_Number,
+
           INSERTED.Report_Type,
+
           INSERTED.Filename,
+
           INSERTED.Uploaded_By,
+
           INSERTED.Uploaded_By_Name,
+
           INSERTED.Uploaded_At_UTC,
+
           INSERTED.Status,
+
           INSERTED.Uploaded_By_Type,
 
           INSERTED.Period,
 
+          INSERTED.Posting_Period_Start,
+
           INSERTED.Posting_Period,
 
           INSERTED.BP_Code,
+
           INSERTED.Contract_ID,
+
           INSERTED.Related_Report_Number
 
         INTO @InsertedReport
@@ -657,12 +744,19 @@ router.post("/register", requireAuth, async (req, res) => {
         VALUES
         (
           @p1,
+
           @p2,
+
           @p3,
+
           GETUTCDATE(),
+
           'new',
+
           @p4,
+
           @p5,
+
           @p6,
 
           @p7,
@@ -670,9 +764,17 @@ router.post("/register", requireAuth, async (req, res) => {
           @p8,
 
           @p9,
+
           @p10,
-          @p11
+
+          @p11,
+
+          @p12
         );
+
+        /* ==============================================================
+           GET NEW REPORT NUMBER
+        ============================================================== */
 
         DECLARE @ReportNumber BIGINT;
 
@@ -681,16 +783,21 @@ router.post("/register", requireAuth, async (req, res) => {
             report_number
         FROM @InsertedReport;
 
-        /*
-         * Report Period(s)
-         *
-         * These are used for:
-         * - Reporting
-         * - Dashboard filtering
-         * - Search
-         *
-         * They are intentionally separate from Posting_Period.
-         */
+        /* ==============================================================
+           REPORT PERIOD(S)
+
+           Example:
+
+           Report Period:
+             Start Period: 2026-01
+             End Period:   2026-03
+
+           dbo.Report_Period:
+
+             553 | 2026-01
+             553 | 2026-03
+        ============================================================== */
+
         INSERT INTO dbo.Report_Period
         (
           Report_Number,
@@ -701,22 +808,37 @@ router.post("/register", requireAuth, async (req, res) => {
 
         COMMIT TRANSACTION;
 
+        /* ==============================================================
+           RETURN CREATED REPORT
+        ============================================================== */
+
         SELECT
           report_number,
+
           report_type,
+
           filename,
+
           uploaded_by,
+
           uploaded_by_name,
+
           uploaded_at_utc,
+
           status,
+
           uploaded_by_type,
 
           period,
 
+          posting_period_start,
+
           posting_period,
 
           bp_code,
+
           contract_id,
+
           related_report_number
 
         FROM @InsertedReport;
@@ -735,16 +857,26 @@ router.post("/register", requireAuth, async (req, res) => {
       END CATCH;
     `;
 
+    /* ==================================================================
+       EXECUTE DATABASE INSERT
+    ================================================================== */
+
     const params = [...fixedParams, ...normalizedReportPeriods];
 
     const { rows } = await query(sql, params);
 
     const inserted = rows?.[0];
 
+    /* ==================================================================
+       SUCCESS LOG
+    ================================================================== */
+
     console.log("✅ Upload registered:", {
       ...inserted,
 
       report_periods: normalizedReportPeriods,
+
+      posting_period_start: finalPostingPeriodStart,
 
       posting_period: finalPostingPeriod,
 
@@ -763,6 +895,8 @@ router.post("/register", requireAuth, async (req, res) => {
 
         report_periods: normalizedReportPeriods,
 
+        posting_period_start: finalPostingPeriodStart,
+
         posting_period: finalPostingPeriod,
 
         posting_periods: normalizedPostingPeriods,
@@ -773,6 +907,8 @@ router.post("/register", requireAuth, async (req, res) => {
       status: inserted?.status || "new",
 
       report_periods: normalizedReportPeriods,
+
+      posting_period_start: finalPostingPeriodStart,
 
       posting_period: finalPostingPeriod,
 
