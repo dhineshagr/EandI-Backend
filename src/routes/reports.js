@@ -3235,63 +3235,26 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
 
       await txQuery(
         `
-              INSERT INTO dbo.Cur_Invoice_Header
-              (
-                Report_Number,
-
-                Report_Type,
-
-                Period,
-
-                Posting_Period,
-
-                BP_Code,
-
-                Contract_ID,
-
-                Related_Report_Number,
-
-                Status,
-
-                Created_At_UTC
-              )
-
-              VALUES
-              (
-                @p1,
-
-                @p2,
-
-                @p3,
-
-                @p4,
-
-                @p5,
-
-                @p6,
-
-                @p7,
-
-                'submitted',
-
-                GETUTCDATE()
-              );
-              `,
-        [
-          reportNumber,
-
-          report_type,
-
-          reportPeriodDisplay,
-
-          resolvedPostingPeriod,
-
-          resolvedBpCode,
-
-          resolvedContractId,
-
-          linkedReportNumber,
-        ],
+  INSERT INTO dbo.Cur_Invoice_Header
+  (
+    Report_Number,
+    Report_Status,
+    Uploaded_By,
+    Uploaded_At_UTC,
+    Created_At_UTC,
+    Updated_At_UTC
+  )
+  VALUES
+  (
+    @p1,
+    'submitted',
+    @p2,
+    GETUTCDATE(),
+    GETUTCDATE(),
+    GETUTCDATE()
+  );
+  `,
+        [reportNumber, uploadedBy],
       );
 
       /* ----------------------------------------------------------
