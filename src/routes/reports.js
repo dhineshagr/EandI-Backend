@@ -249,21 +249,29 @@ function sendRouteError(res, next, error) {
 
 const editableDetailFields = new Set([
   "customer_id",
-  "member_number",
+
+  // Member Number intentionally excluded.
+  // Client requirement: Member Number is read-only on View Report.
+
   "member_name",
   "member_address",
   "member_city",
   "member_state",
   "member_zip",
+
+  // Selected Member Number remains editable.
   "matched_member_number",
+
   "po",
   "invoice",
   "invoice_date",
+
   "ship_to",
   "ship_to_address",
   "ship_to_city",
   "ship_to_state",
   "ship_to_zip",
+
   "item",
   "manufacturer",
   "manufacturer_part",
