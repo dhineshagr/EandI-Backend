@@ -3264,195 +3264,108 @@ router.post("/reports/manual-create", requireAuth, async (req, res, next) => {
       for (const row of detailRowsToStage) {
         await txQuery(
           `
-                INSERT INTO dbo.Stg_Invoice_Raw
-                (
-                  Report_Number,
-
-                  Customer_ID,
-
-                  Member_Number,
-
-                  Member_Name,
-
-                  Member_Address,
-
-                  Member_City,
-
-                  Member_State,
-
-                  Member_Zip,
-
-                  PO,
-
-                  Invoice,
-
-                  Invoice_Date,
-
-                  Ship_To,
-
-                  Ship_To_Address,
-
-                  Ship_To_City,
-
-                  Ship_To_State,
-
-                  Ship_To_Zip,
-
-                  Item,
-
-                  Manufacturer,
-
-                  Manufacturer_Part,
-
-                  UM,
-
-                  Description,
-
-                  UNSPSC,
-
-                  Category,
-
-                  SubCategory,
-
-                  Retail_Price,
-
-                  Contract_Price,
-
-                  Qty,
-
-                  Purchase_Dollars,
-
-                  CAF,
-
-                  CAF_Dollars,
-
-                  Created_At_UTC
-                )
-
-                VALUES
-                (
-                  @p1,
-
-                  @p2,
-
-                  @p3,
-
-                  @p4,
-
-                  @p5,
-
-                  @p6,
-
-                  @p7,
-
-                  @p8,
-
-                  @p9,
-
-                  @p10,
-
-                  @p11,
-
-                  @p12,
-
-                  @p13,
-
-                  @p14,
-
-                  @p15,
-
-                  @p16,
-
-                  @p17,
-
-                  @p18,
-
-                  @p19,
-
-                  @p20,
-
-                  @p21,
-
-                  @p22,
-
-                  @p23,
-
-                  @p24,
-
-                  @p25,
-
-                  @p26,
-
-                  @p27,
-
-                  @p28,
-
-                  @p29,
-
-                  @p30,
-
-                  GETUTCDATE()
-                );
-                `,
+  INSERT INTO dbo.Stg_Invoice_Raw
+  (
+    Report_Number,
+    Customer_ID,
+    Member_Number,
+    Member_Name,
+    Member_Address,
+    Member_City,
+    Member_State,
+    Member_Zip,
+    PO,
+    Invoice,
+    Invoice_Date,
+    Ship_To,
+    Ship_To_Address,
+    Ship_To_City,
+    Ship_To_State,
+    Ship_To_Zip,
+    Item,
+    Manufacturer,
+    Manufacturer_Part,
+    UM,
+    [Desc],
+    UNSPSC,
+    Category,
+    SubCategory,
+    Retail_Price,
+    Contract_Price,
+    Qty,
+    Purchase_Dollars,
+    CAF,
+    CAF_Dollars,
+    Created_At_UTC
+  )
+  VALUES
+  (
+    @p1,
+    @p2,
+    @p3,
+    @p4,
+    @p5,
+    @p6,
+    @p7,
+    @p8,
+    @p9,
+    @p10,
+    @p11,
+    @p12,
+    @p13,
+    @p14,
+    @p15,
+    @p16,
+    @p17,
+    @p18,
+    @p19,
+    @p20,
+    @p21,
+    @p22,
+    @p23,
+    @p24,
+    @p25,
+    @p26,
+    @p27,
+    @p28,
+    @p29,
+    @p30,
+    GETUTCDATE()
+  );
+  `,
           [
             reportNumber,
-
             nullIfEmpty(row.customer_id),
-
             nullIfEmpty(row.member_number),
-
             nullIfEmpty(row.member_name),
-
             nullIfEmpty(row.member_address),
-
             nullIfEmpty(row.member_city),
-
             nullIfEmpty(row.member_state),
-
             nullIfEmpty(row.member_zip),
-
             nullIfEmpty(row.po),
-
             nullIfEmpty(row.invoice),
-
             nullIfEmpty(row.invoice_date),
-
             nullIfEmpty(row.ship_to),
-
             nullIfEmpty(row.ship_to_address),
-
             nullIfEmpty(row.ship_to_city),
-
             nullIfEmpty(row.ship_to_state),
-
             nullIfEmpty(row.ship_to_zip),
-
             nullIfEmpty(row.item),
-
             nullIfEmpty(row.manufacturer),
-
             nullIfEmpty(row.manufacturer_part),
-
             nullIfEmpty(row.um),
 
-            nullIfEmpty(row.description),
+            // Frontend field is still "desc".
+            nullIfEmpty(row.desc),
 
             nullIfEmpty(row.unspsc),
-
             nullIfEmpty(row.category),
-
             nullIfEmpty(row.subcategory),
-
             nullIfEmpty(row.retail_price),
-
             nullIfEmpty(row.contract_price),
-
             nullIfEmpty(row.qty),
-
             nullIfEmpty(row.purchase_dollars),
-
             nullIfEmpty(row.caf),
-
             nullIfEmpty(row.caf_dollars),
           ],
         );
